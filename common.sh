@@ -16,7 +16,16 @@ _BASE_DIR="$(dirname "$_LIB_DIR")"
 CONFIG_FILE="${_BASE_DIR}/config/monitor.conf"
 
 if [ ! -f "$CONFIG_FILE" ]; then
+    echo "" >&2
     echo "[ERROR] monitor.conf not found at: $CONFIG_FILE" >&2
+    echo "" >&2
+    echo "  Fix: ensure your directory structure is:" >&2
+    echo "    /opt/hostmon/config/monitor.conf" >&2
+    echo "    /opt/hostmon/lib/common.sh" >&2
+    echo "    /opt/hostmon/cpu_investigate.sh  (etc)" >&2
+    echo "" >&2
+    echo "  Run installer: bash /opt/hostmon/install.sh" >&2
+    echo "" >&2
     exit 1
 fi
 source "$CONFIG_FILE"

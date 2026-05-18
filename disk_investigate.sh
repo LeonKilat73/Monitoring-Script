@@ -14,7 +14,8 @@
 #   bash disk_investigate.sh --slack            # Post findings to Slack
 # =============================================================================
 
-source "$(dirname "$0")/lib/common.sh"
+HOSTMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${HOSTMON_DIR}/lib/common.sh"
 require_root
 require_cmds df du awk find sort
 

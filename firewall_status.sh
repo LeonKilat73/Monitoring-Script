@@ -11,7 +11,8 @@
 #   bash firewall_status.sh --minutes 30  # Lookback window override
 # =============================================================================
 
-source "$(dirname "$0")/lib/common.sh"
+HOSTMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${HOSTMON_DIR}/lib/common.sh"
 require_root
 require_cmds awk grep sort
 
