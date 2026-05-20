@@ -1,467 +1,392 @@
 #!/bin/bash
 # =============================================================================
-# /opt/hostmon/mail_investigate.sh
-# =============================================================================
-# PURPOSE: When Zabbix fires a mail queue alert, run this to find out:
-#   - How big is the queue and what type of mail is in it
+# mail_investigate.sh — Self-contained Mail Queue Investigation
+# Drop anywhere, run as root. No external dependencies.
+#
+# PURPOSE: When Zabbix fires a mail queue alert, find out:
+#   - Queue size, frozen vs deferred vs active breakdown
 #   - Which cPanel account / email address is the spam source
-#   - Whether queued mail looks legitimate or bulk/spam
-#   - Options to freeze, remove, or block the offending account/address
+#   - Which PHP script is originating the mail
+#   - SMTP credential abuse detection
+#   - Server IP blacklist check
+#   - Actions: freeze, unfreeze, remove, block, suspend (all require confirmation)
 #
 # USAGE:
-#   bash mail_investigate.sh                    # Full investigation
-#   bash mail_investigate.sh --user joe         # Focus on cPanel account
-#   bash mail_investigate.sh --slack            # Post findings to Slack
-#   bash mail_investigate.sh --action freeze    # Freeze queue for account
-#   bash mail_investigate.sh --action remove    # Remove queue for account (with confirm)
-#   bash mail_investigate.sh --action block     # Block outbound mail for account
-#
-# ACTIONS ARE PROMPTED — nothing executes without admin confirmation
+#   bash mail_investigate.sh                          # Full report
+#   bash mail_investigate.sh --user johndoe           # Focus on one account
+#   bash mail_investigate.sh --user johndoe --action freeze
+#   bash mail_investigate.sh --user johndoe --action remove
+#   bash mail_investigate.sh --user johndoe --action block
+#   bash mail_investigate.sh --user johndoe --action suspend
+#   bash mail_investigate.sh --user johndoe --action report
 # =============================================================================
 
-HOSTMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${HOSTMON_DIR}/lib/common.sh"
-require_root
-require_cmds exim awk grep sort
-
 TARGET_USER=""
-POST_SLACK=false
 ACTION=""
+TOP_COUNT=15
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
         --user)   TARGET_USER="$2"; shift ;;
-        --slack)  POST_SLACK=true ;;
-        --action) ACTION="$2"; shift ;;
+        --action) ACTION="$2";      shift ;;
+        --top)    TOP_COUNT="$2";   shift ;;
     esac
     shift
 done
 
-SLACK_BUFFER=""
-_sbuf() { SLACK_BUFFER+="$*"$'\n'; }
+# --- Colors
+R='\033[0;31m'; Y='\033[1;33m'; G='\033[0;32m'
+C='\033[0;36m'; B='\033[1m';    D='\033[2m'; N='\033[0m'
 
-# =============================================================================
-# HELPERS
-# =============================================================================
+# --- Root check
+if [ "$EUID" -ne 0 ]; then
+    echo "Run as root." >&2
+    exit 1
+fi
 
-# Ask admin for confirmation before any destructive action
+sep()  { echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"; }
+hdr()  { echo ""; sep; echo -e "${B}  $*${N}"; sep; }
+info() { echo -e "  ${C}•${N} $*"; }
+warn() { echo -e "  ${Y}▲${N} $*"; }
+crit() { echo -e "  ${R}✖${N} $*"; }
+ok()   { echo -e "  ${G}✔${N} $*"; }
+
+# Confirm prompt — requires typing YES
 _confirm() {
-    local prompt="$1"
     echo ""
-    echo -e "${C_YELLOW}  ⚠  ${prompt}${C_RESET}"
+    echo -e "  ${Y}⚠  $1${N}"
     echo -ne "  Type YES to confirm: "
     read -r answer
     [ "$answer" = "YES" ]
 }
 
-# Map an email sender domain/user back to a cPanel account
+# Map email address to cPanel account via /etc/userdomains
 _email_to_cpanel() {
     local email="$1"
     local domain="${email#*@}"
     local user="${email%@*}"
-
-    # Check /etc/userdomains (cPanel domain→user map)
     if [ -f /etc/userdomains ]; then
-        local cpanel_user
-        cpanel_user=$(grep -i "^${domain}:" /etc/userdomains 2>/dev/null | \
-                      awk '{print $2}' | head -1)
-        [ -n "$cpanel_user" ] && echo "$cpanel_user" && return
+        local found
+        found=$(grep -i "^${domain}:" /etc/userdomains 2>/dev/null | \
+                awk '{print $2}' | head -1)
+        [ -n "$found" ] && echo "$found" && return
     fi
-
-    # Check if local system user matches
     id "$user" &>/dev/null && echo "$user" && return
-
     echo "unknown"
 }
 
-# =============================================================================
-# SECTION 1 — Queue overview snapshot
-# =============================================================================
-section_queue_overview() {
-    section "1. MAIL QUEUE OVERVIEW"
+# Get domain for a cPanel user
+_user_to_domain() {
+    local user="$1"
+    grep -i ":.*${user}$" /etc/userdomains 2>/dev/null | \
+        awk -F: '{print $1}' | head -1 | tr -d ' '
+}
+
+HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+
+echo ""
+echo -e "${B}╔══════════════════════════════════════════════════════════════╗${N}"
+echo -e "${B}  MAIL QUEUE INVESTIGATION — ${HOSTNAME}${N}"
+echo -e "${D}  $(date '+%Y-%m-%d %H:%M:%S')${N}"
+[ -n "$TARGET_USER" ] && echo -e "${D}  Account filter: ${TARGET_USER}${N}"
+[ -n "$ACTION"      ] && echo -e "${D}  Action: ${ACTION}${N}"
+echo -e "${B}╚══════════════════════════════════════════════════════════════╝${N}"
+
+# Exim check — bail early with helpful message if not found
+if ! command -v exim &>/dev/null; then
     echo ""
-
-    _sbuf "=== MAIL QUEUE OVERVIEW ==="
-
-    # Total queue size
-    local total_count
-    total_count=$(exim -bpc 2>/dev/null || echo "0")
-
-    local color="$C_GREEN"
-    [ "$total_count" -gt 500  ] && color="$C_YELLOW"
-    [ "$total_count" -gt 2000 ] && color="$C_RED"
-
-    echo -e "  ${C_BOLD}Total messages in queue:${C_RESET} ${color}${total_count}${C_RESET}"
-    _sbuf "Queue total: $total_count messages"
-
-    # Queue age breakdown — frozen vs active vs deferred
-    local frozen_count active_count deferred_count
-    frozen_count=$(exim -bp 2>/dev/null | grep -c "frozen" || echo 0)
-    deferred_count=$(exim -bp 2>/dev/null | \
-                     grep -v frozen | grep -c "^\s*[0-9]" || echo 0)
-    active_count=$((total_count - frozen_count - deferred_count))
-    [ "$active_count" -lt 0 ] && active_count=0
-
-    printf "\n  %-25s %s\n" "Active (queued to send):" "$active_count"
-    printf   "  %-25s %s\n" "Deferred (retry later):"  "$deferred_count"
-    printf   "  %-25s %s\n" "Frozen (stuck/failed):"   "$frozen_count"
-
-    _sbuf "Active: $active_count | Deferred: $deferred_count | Frozen: $frozen_count"
-
-    # Queue disk usage
+    crit "Exim not found in PATH. Is this a cPanel/Exim server?"
     echo ""
-    local queue_size
-    queue_size=$(du -sh /var/spool/exim/input 2>/dev/null | awk '{print $1}')
-    log_info "Queue disk usage: ${queue_size:-unknown}"
-    _sbuf "Queue disk: $queue_size"
+    exit 1
+fi
 
-    # Alert if queue is dangerously large
-    if [ "$total_count" -gt 5000 ]; then
-        log_crit "Queue exceeds 5000 — server may be blacklisted or under active spam attack"
-        _sbuf "CRITICAL: Queue > 5000 — blacklist risk"
-    elif [ "$total_count" -gt 1000 ]; then
-        log_warn "Queue exceeds 1000 — investigate spam source immediately"
-        _sbuf "WARNING: Queue > 1000"
-    elif [ "$total_count" -gt 200 ]; then
-        log_warn "Queue is elevated (${total_count}) — monitor closely"
-    else
-        log_ok "Queue size is within normal range."
+# =============================================================================
+# SECTION 1 — Queue overview
+# =============================================================================
+hdr "1. MAIL QUEUE OVERVIEW"
+echo ""
+
+TOTAL_COUNT=$(exim -bpc 2>/dev/null || echo "0")
+QUEUE_DISK=$(du -sh /var/spool/exim/input 2>/dev/null | awk '{print $1}')
+
+# Color the total count
+QCLR=$G
+[ "${TOTAL_COUNT:-0}" -gt 200  ] && QCLR=$Y
+[ "${TOTAL_COUNT:-0}" -gt 1000 ] && QCLR=$R
+
+echo -e "  ${B}Total messages in queue :${N} ${QCLR}${TOTAL_COUNT}${N}"
+echo -e "  ${B}Queue disk usage        :${N} ${QUEUE_DISK:-unknown}"
+echo ""
+
+# Breakdown: frozen / deferred / active
+FROZEN_COUNT=$(exim -bp 2>/dev/null | grep -c "frozen" || echo 0)
+DEFERRED_COUNT=$(exim -bp 2>/dev/null | grep -v frozen | \
+                 awk '/^\s+[0-9]/' | wc -l || echo 0)
+ACTIVE_COUNT=$(( TOTAL_COUNT - FROZEN_COUNT - DEFERRED_COUNT ))
+[ "$ACTIVE_COUNT" -lt 0 ] && ACTIVE_COUNT=0
+
+printf "  %-28s ${G}%s${N}\n" "Active (queued to send):"  "$ACTIVE_COUNT"
+printf "  %-28s ${Y}%s${N}\n" "Deferred (retry pending):" "$DEFERRED_COUNT"
+printf "  %-28s ${R}%s${N}\n" "Frozen (stuck/failed):"    "$FROZEN_COUNT"
+echo ""
+
+if   [ "${TOTAL_COUNT:-0}" -gt 5000 ]; then
+    crit "Queue exceeds 5000 — server may already be blacklisted. Act immediately."
+elif [ "${TOTAL_COUNT:-0}" -gt 1000 ]; then
+    crit "Queue exceeds 1000 — spam source must be identified and stopped now."
+elif [ "${TOTAL_COUNT:-0}" -gt 200 ]; then
+    warn "Queue elevated (${TOTAL_COUNT}) — investigate and monitor closely."
+else
+    ok   "Queue size is within normal range."
+fi
+
+# =============================================================================
+# SECTION 2 — Top senders in queue
+# =============================================================================
+hdr "2. TOP SENDERS IN QUEUE"
+echo ""
+
+printf "${B}  %-6s %-42s %-20s %-s${N}\n" \
+    "COUNT" "SENDER ADDRESS" "cPANEL ACCOUNT" "VERDICT"
+echo "  ──────────────────────────────────────────────────────────────────────"
+
+# Parse all sender addresses from exim -bp output
+declare -A SENDER_COUNT
+while IFS= read -r line; do
+    if echo "$line" | grep -qE '<[^>]*@[^>]*>'; then
+        SENDER=$(echo "$line" | grep -oE '<[^>]+>' | tr -d '<>' | head -1)
+        [ -n "$SENDER" ] && \
+            SENDER_COUNT["$SENDER"]=$(( ${SENDER_COUNT["$SENDER"]:-0} + 1 ))
     fi
-}
+done < <(exim -bp 2>/dev/null)
 
-# =============================================================================
-# SECTION 2 — Top senders (who is filling the queue)
-# =============================================================================
-section_top_senders() {
-    section "2. TOP SENDERS IN QUEUE"
-    echo ""
+RANK=0
+for SENDER in $(for k in "${!SENDER_COUNT[@]}"; do
+                    echo "${SENDER_COUNT[$k]} $k"
+                done | sort -rn | awk '{print $2}'); do
 
-    _sbuf ""
-    _sbuf "=== TOP SENDERS ==="
+    CNT="${SENDER_COUNT[$SENDER]}"
+    CPANEL_ACCT=$(_email_to_cpanel "$SENDER")
 
-    printf "${C_BOLD}%-6s %-45s %-20s %-s${C_RESET}\n" \
-        "COUNT" "SENDER ADDRESS" "cPANEL ACCOUNT" "VERDICT"
-    echo "──────────────────────────────────────────────────────────────────────"
-
-    # Extract all sender addresses from queue
-    local queue_data
-    queue_data=$(exim -bp 2>/dev/null)
-
-    declare -A sender_count
-    while IFS= read -r line; do
-        # Lines with sender look like:  1d  2.3K abc123def <sender@domain.com>
-        if echo "$line" | grep -qE '<[^>]+@[^>]+>'; then
-            local sender
-            sender=$(echo "$line" | grep -oE '<[^>]+>' | tr -d '<>' | head -1)
-            [ -n "$sender" ] && sender_count["$sender"]=$(( ${sender_count["$sender"]:-0} + 1 ))
-        fi
-    done <<< "$queue_data"
-
-    local rank=0
-    for sender in $(for k in "${!sender_count[@]}"; do
-                        echo "${sender_count[$k]} $k"
-                    done | sort -rn | awk '{print $2}' | \
-                    { [ -n "$TARGET_USER" ] && \
-                      while IFS= read -r s; do
-                          cpanel=$(_email_to_cpanel "$s")
-                          [ "$cpanel" = "$TARGET_USER" ] && echo "$s"
-                      done || cat; }); do
-
-        local count="${sender_count[$sender]}"
-        local cpanel_account
-        cpanel_account=$(_email_to_cpanel "$sender")
-
-        # Determine verdict
-        local verdict color
-        if [ "$count" -ge 500 ]; then
-            verdict="SPAM — suspend immediately"; color="$C_RED"
-        elif [ "$count" -ge 100 ]; then
-            verdict="Likely spam — investigate";  color="$C_YELLOW"
-        elif [ "$count" -ge 20 ]; then
-            verdict="Elevated — monitor";          color="$C_CYAN"
-        else
-            verdict="Normal";                      color="$C_RESET"
-        fi
-
-        printf "${color}%-6s %-45s %-20s %-s${C_RESET}\n" \
-            "$count" "$sender" "$cpanel_account" "$verdict"
-
-        _sbuf "$(printf '%-6s %-45s %-20s %-s' \
-            "$count" "$sender" "$cpanel_account" "$verdict")"
-
-        rank=$((rank + 1))
-        [ "$rank" -ge "$TOP_ACCOUNTS_COUNT" ] && break
-    done
-}
-
-# =============================================================================
-# SECTION 3 — Top recipient domains (where is spam going)
-# =============================================================================
-section_top_recipients() {
-    section "3. TOP RECIPIENT DOMAINS"
-    echo ""
-
-    _sbuf ""
-    _sbuf "=== TOP RECIPIENTS ==="
-
-    log_info "Recipient domains with most queued messages:"
-    echo ""
-
-    # Parse recipient lines from exim -bp (lines with @domain after sender block)
-    exim -bp 2>/dev/null | \
-        grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | \
-        awk -F@ '{print $2}' | \
-        sort | uniq -c | sort -rn | head -20 | \
-        while read -r count domain; do
-            local flag=""
-            # Flag if sending to same domain in bulk (possible targeted attack)
-            [ "$count" -ge 100 ] && flag=" ◄ BULK TARGET"
-            printf "  %-6s %s%s\n" "$count" "$domain" "$flag"
-            _sbuf "  RCPT: $count -> $domain$flag"
-        done
-}
-
-# =============================================================================
-# SECTION 4 — Sample message inspection (is it spam?)
-# =============================================================================
-section_sample_inspection() {
-    section "4. SAMPLE MESSAGE INSPECTION"
-    echo ""
-
-    _sbuf ""
-    _sbuf "=== SAMPLE MESSAGES ==="
-
-    log_info "Sampling queued message headers to classify content..."
-    echo ""
-
-    local spam_indicators=0
-    local sample_count=0
-
-    # Get up to 10 message IDs from the queue
-    local msg_ids
-    msg_ids=$(exim -bp 2>/dev/null | awk '/^\s*[0-9]+[smhdw]/{print $3}' | \
-              head -10)
-
-    for msg_id in $msg_ids; do
-        [ -z "$msg_id" ] && continue
-        sample_count=$((sample_count + 1))
-
-        local msg_header
-        msg_header=$(exim -Mvh "$msg_id" 2>/dev/null | head -40)
-
-        local sender subject from_header
-        sender=$(echo "$msg_header"     | grep -i "^return-path:" | head -1)
-        from_header=$(echo "$msg_header" | grep -i "^from:"       | head -1)
-        subject=$(echo "$msg_header"    | grep -i "^subject:"     | head -1)
-
-        echo -e "  ${C_BOLD}Message: ${msg_id}${C_RESET}"
-        echo    "  $sender"
-        echo    "  $from_header"
-        echo    "  $subject"
-
-        # Spam heuristics
-        local flags=()
-
-        # Check for missing/forged headers
-        echo "$msg_header" | grep -qi "^x-spam"         && flags+=("X-Spam header present")
-        echo "$msg_header" | grep -qi "^x-php-originating-script" && \
-            flags+=("PHP-originated — check script path")
-        ! echo "$msg_header" | grep -qi "^message-id:"  && flags+=("Missing Message-ID")
-        ! echo "$msg_header" | grep -qi "^date:"        && flags+=("Missing Date header")
-        echo "$subject" | grep -qiE 'viagra|casino|lottery|winner|prize|click here|urgent|verify your|account suspended|bitcoin|crypto' && \
-            flags+=("Spam keyword in subject")
-
-        # PHP script path (cPanel logs it)
-        local php_script
-        php_script=$(echo "$msg_header" | grep -i "x-php-originating-script" | \
-                     grep -oE '/home/[^:]+' | head -1)
-        [ -n "$php_script" ] && flags+=("Sent via PHP: $php_script")
-
-        if [ ${#flags[@]} -gt 0 ]; then
-            spam_indicators=$((spam_indicators + 1))
-            for flag in "${flags[@]}"; do
-                log_warn "    ◄ $flag"
-                _sbuf "  SPAM FLAG [$msg_id]: $flag"
-            done
-        else
-            log_ok "    No obvious spam indicators."
-        fi
-
-        echo ""
-    done
-
-    echo "──────────────────────────────────────────────────────────────"
-    log_info "Sampled ${sample_count} messages | Spam indicators: ${spam_indicators}/${sample_count}"
-    _sbuf "Sampled: $sample_count | Spam flags: $spam_indicators"
-}
-
-# =============================================================================
-# SECTION 5 — PHP script origination (which script is sending mail)
-# =============================================================================
-section_php_origination() {
-    section "5. PHP MAIL SCRIPT ORIGINATION"
-    echo ""
-
-    _sbuf ""
-    _sbuf "=== PHP ORIGINATING SCRIPTS ==="
-
-    log_info "Checking which PHP scripts are generating queued mail..."
-    echo ""
-
-    # Parse X-PHP-Originating-Script headers from all queued messages
-    declare -A script_count
-    local msg_ids
-    msg_ids=$(exim -bp 2>/dev/null | awk '/^\s*[0-9]+[smhdw]/{print $3}' | head -200)
-
-    for msg_id in $msg_ids; do
-        [ -z "$msg_id" ] && continue
-        local script
-        script=$(exim -Mvh "$msg_id" 2>/dev/null | \
-                 grep -i "x-php-originating-script" | \
-                 grep -oE '/home/[^ ]+' | head -1)
-        [ -n "$script" ] && \
-            script_count["$script"]=$(( ${script_count["$script"]:-0} + 1 ))
-    done
-
-    if [ ${#script_count[@]} -eq 0 ]; then
-        log_ok "No PHP originating script headers found in sampled messages."
-        log_dim "(Mail may be sent via SMTP auth or sendmail directly)"
-        _sbuf "No PHP originating scripts detected in sample."
-        return
+    # Filter by user if specified
+    if [ -n "$TARGET_USER" ] && [ "$CPANEL_ACCT" != "$TARGET_USER" ]; then
+        continue
     fi
 
-    printf "${C_BOLD}%-8s %-50s %-s${C_RESET}\n" "COUNT" "SCRIPT PATH" "OWNER"
-    echo "──────────────────────────────────────────────────────────────────────"
+    CLR=$N; VERDICT="Normal"
+    if   [ "$CNT" -ge 500 ]; then CLR=$R; VERDICT="SPAM — suspend immediately"
+    elif [ "$CNT" -ge 100 ]; then CLR=$Y; VERDICT="Likely spam — investigate"
+    elif [ "$CNT" -ge 20  ]; then CLR=$C; VERDICT="Elevated — monitor"
+    fi
 
-    for script in $(for k in "${!script_count[@]}"; do
-                        echo "${script_count[$k]} $k"
+    printf "${CLR}  %-6s %-42s %-20s %-s${N}\n" \
+        "$CNT" "$SENDER" "$CPANEL_ACCT" "$VERDICT"
+
+    RANK=$((RANK + 1))
+    [ "$RANK" -ge "$TOP_COUNT" ] && break
+done
+
+[ "$RANK" -eq 0 ] && info "No sender addresses found in queue."
+
+# =============================================================================
+# SECTION 3 — Top recipient domains
+# =============================================================================
+hdr "3. TOP RECIPIENT DOMAINS (where is it going?)"
+echo ""
+
+info "Recipient domains with most queued messages:"
+echo ""
+exim -bp 2>/dev/null | \
+    grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | \
+    awk -F@ '{print $2}' | \
+    sort | uniq -c | sort -rn | head -15 | \
+    while read -r cnt domain; do
+        FLAG=""
+        CLR=$N
+        [ "$cnt" -ge 100 ] && FLAG=" ◄ BULK TARGET" && CLR=$Y
+        printf "${CLR}    %-6s %s%s${N}\n" "$cnt" "$domain" "$FLAG"
+    done
+
+# =============================================================================
+# SECTION 4 — PHP script origination
+# =============================================================================
+hdr "4. PHP MAIL SCRIPT ORIGINATION"
+echo ""
+
+info "Scanning queued message headers for X-PHP-Originating-Script..."
+echo ""
+
+declare -A SCRIPT_COUNT
+MSG_IDS=$(exim -bp 2>/dev/null | awk '/^\s+[0-9]+[smhdw]/{print $3}' | head -150)
+
+for MSG_ID in $MSG_IDS; do
+    [ -z "$MSG_ID" ] && continue
+    SCRIPT=$(exim -Mvh "$MSG_ID" 2>/dev/null | \
+             grep -i "x-php-originating-script" | \
+             grep -oE '/home/[^ ]+' | head -1)
+    [ -n "$SCRIPT" ] && \
+        SCRIPT_COUNT["$SCRIPT"]=$(( ${SCRIPT_COUNT["$SCRIPT"]:-0} + 1 ))
+done
+
+if [ ${#SCRIPT_COUNT[@]} -eq 0 ]; then
+    ok "No PHP originating script headers found in sampled messages."
+    info "(Mail may be sent via SMTP auth or direct sendmail call)"
+else
+    printf "  ${B}%-8s %-50s %-s${N}\n" "COUNT" "SCRIPT PATH" "OWNER"
+    echo "  ──────────────────────────────────────────────────────────────────────"
+
+    for SCRIPT in $(for k in "${!SCRIPT_COUNT[@]}"; do
+                        echo "${SCRIPT_COUNT[$k]} $k"
                     done | sort -rn | awk '{print $2}'); do
+        CNT="${SCRIPT_COUNT[$SCRIPT]}"
+        OWNER=$(stat -c '%U' "$SCRIPT" 2>/dev/null || echo "unknown")
+        CLR=$N
+        [ "$CNT" -ge 50 ] && CLR=$R
+        [ "$CNT" -ge 10 ] && [ "$CNT" -lt 50 ] && CLR=$Y
 
-        local count="${script_count[$script]}"
-        local owner
-        owner=$(stat -c '%U' "$script" 2>/dev/null || echo "unknown")
-        local color="$C_RESET"
-        [ "$count" -ge 50 ] && color="$C_RED"
-        [ "$count" -ge 10 ] && [ "$count" -lt 50 ] && color="$C_YELLOW"
+        printf "${CLR}  %-8s %-50s %-s${N}\n" "$CNT" "$SCRIPT" "$OWNER"
 
-        printf "${color}%-8s %-50s %-s${C_RESET}\n" "$count" "$script" "$owner"
-        _sbuf "PHP SCRIPT: $count msgs from $script (owner: $owner)"
-
-        # Try to determine if script is a known CMS mailer or suspicious
-        case "$script" in
+        # Classify the script
+        case "$SCRIPT" in
             */wp-includes/*|*/wp-content/*)
-                log_dim "    → WordPress mailer (check for spam plugins or compromised theme)"
-                ;;
-            */components/com_*/|*/joomla/*)
-                log_dim "    → Joomla component (check for vulnerable extension)"
-                ;;
+                info "  → WordPress mailer — check for compromised plugin or theme" ;;
+            */components/*|*/joomla/*)
+                info "  → Joomla component — check for vulnerable extension" ;;
             */tmp/*|*/cache/*)
-                log_crit "    → Script in tmp/cache dir — HIGHLY SUSPICIOUS (webshell/dropper)"
-                _sbuf "  CRITICAL: script in /tmp or /cache — likely malware"
-                ;;
+                crit "  → Script in /tmp or /cache — HIGHLY SUSPICIOUS (webshell/dropper)" ;;
             */public_html/*)
-                log_dim "    → In public_html — review script for mail() abuse"
-                ;;
+                info "  → In public_html — review script for mail() abuse" ;;
         esac
     done
-}
+fi
 
 # =============================================================================
-# SECTION 6 — SMTP auth abuse (brute-forced or compromised credentials)
+# SECTION 5 — Sample message inspection
 # =============================================================================
-section_smtp_auth_abuse() {
-    section "6. SMTP AUTH ABUSE DETECTION"
-    echo ""
+hdr "5. SAMPLE MESSAGE HEADER INSPECTION"
+echo ""
 
-    _sbuf ""
-    _sbuf "=== SMTP AUTH ==="
+info "Sampling up to 8 queued messages for spam indicators..."
+echo ""
 
-    local exim_main_log="/var/log/exim_mainlog"
-    [ ! -f "$exim_main_log" ] && exim_main_log="/var/log/exim/mainlog"
+SPAM_FLAGS=0
+SAMPLE=0
+MSG_IDS=$(exim -bp 2>/dev/null | awk '/^\s+[0-9]+[smhdw]/{print $3}' | head -8)
 
-    if [ ! -f "$exim_main_log" ]; then
-        log_warn "Exim main log not found. Checked: /var/log/exim_mainlog"
-        return
-    fi
+for MSG_ID in $MSG_IDS; do
+    [ -z "$MSG_ID" ] && continue
+    SAMPLE=$((SAMPLE + 1))
 
-    # Authenticated senders in last hour
-    log_info "Top SMTP authenticated senders (last 1000 log lines):"
-    echo ""
+    HDR=$(exim -Mvh "$MSG_ID" 2>/dev/null | head -40)
+    FROM_HDR=$(echo  "$HDR" | grep -i "^from:"        | head -1)
+    RETURN=$(echo    "$HDR" | grep -i "^return-path:" | head -1)
+    SUBJECT=$(echo   "$HDR" | grep -i "^subject:"     | head -1)
+    PHP_HDR=$(echo   "$HDR" | grep -i "x-php-originating-script" | head -1)
 
-    tail -1000 "$exim_main_log" 2>/dev/null | \
-        grep "A=dovecot_plain\|A=plain\|A=login\|authenticated" | \
-        grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | \
-        sort | uniq -c | sort -rn | head -15 | \
-        while read -r count email; do
-            local cpanel_account
-            cpanel_account=$(_email_to_cpanel "$email")
-            local flag=""
-            local color="$C_RESET"
-            [ "$count" -ge 200 ] && flag=" ◄ CREDENTIAL ABUSE" && color="$C_RED"
-            [ "$count" -ge 50  ] && flag=" ◄ HIGH VOLUME"       && color="$C_YELLOW"
-            printf "${color}  %-6s %-40s %-20s%s${C_RESET}\n" \
-                "$count" "$email" "$cpanel_account" "$flag"
-            _sbuf "  SMTP AUTH: $count $email ($cpanel_account)$flag"
+    echo -e "  ${B}── Message: ${MSG_ID} ──${N}"
+    [ -n "$RETURN"  ] && echo "    $RETURN"
+    [ -n "$FROM_HDR"] && echo "    $FROM_HDR"
+    [ -n "$SUBJECT" ] && echo "    $SUBJECT"
+    [ -n "$PHP_HDR" ] && echo -e "    ${Y}$PHP_HDR${N}"
+
+    # Spam heuristics
+    FLAGS=()
+    [ -z "$(echo "$HDR" | grep -i '^message-id:')" ]  && FLAGS+=("Missing Message-ID")
+    [ -z "$(echo "$HDR" | grep -i '^date:')" ]         && FLAGS+=("Missing Date header")
+    echo "$HDR" | grep -qi "^x-spam"                   && FLAGS+=("X-Spam header present")
+    [ -n "$PHP_HDR" ]                                  && FLAGS+=("PHP-originated mail")
+    echo "$SUBJECT" | grep -qiE \
+        'viagra|casino|lottery|winner|prize|urgent|verify|suspended|bitcoin|crypto|click here' && \
+        FLAGS+=("Spam keyword in subject")
+
+    if [ ${#FLAGS[@]} -gt 0 ]; then
+        SPAM_FLAGS=$((SPAM_FLAGS + 1))
+        for F in "${FLAGS[@]}"; do
+            warn "    ◄ $F"
         done
-
-    # Failed auth attempts (credential stuffing / brute force)
-    echo ""
-    log_info "Recent SMTP authentication failures (last 1000 lines):"
-    local auth_fails
-    auth_fails=$(tail -1000 "$exim_main_log" 2>/dev/null | \
-                 grep -c "authenticator failed\|535 " || echo 0)
-
-    if [ "$auth_fails" -gt 50 ]; then
-        log_crit "SMTP auth failures: ${auth_fails} — possible credential stuffing attack"
-        _sbuf "SMTP AUTH FAILURES: $auth_fails — brute force risk"
-    elif [ "$auth_fails" -gt 10 ]; then
-        log_warn "SMTP auth failures: ${auth_fails}"
-        _sbuf "SMTP auth failures: $auth_fails"
     else
-        log_ok "SMTP auth failures: ${auth_fails} (normal)"
+        ok   "    No obvious spam indicators."
     fi
-
-    # IPs with most auth failures
     echo ""
-    log_info "IPs with most SMTP auth failures:"
-    tail -1000 "$exim_main_log" 2>/dev/null | \
-        grep "authenticator failed\|535 " | \
-        grep -oE '\[([0-9]{1,3}\.){3}[0-9]{1,3}\]' | tr -d '[]' | \
-        sort | uniq -c | sort -rn | head -10 | \
-        while read -r count ip; do
-            printf "  %-6s %s\n" "$count" "$ip"
+done
+
+echo "  ──────────────────────────────────────────────────────────────────────"
+info "Sampled: ${SAMPLE} messages | Spam flags: ${SPAM_FLAGS}/${SAMPLE}"
+
+# =============================================================================
+# SECTION 6 — SMTP auth abuse detection
+# =============================================================================
+hdr "6. SMTP AUTH ABUSE DETECTION"
+echo ""
+
+EXIM_LOG="/var/log/exim_mainlog"
+[ ! -f "$EXIM_LOG" ] && EXIM_LOG="/var/log/exim/mainlog"
+
+if [ ! -f "$EXIM_LOG" ]; then
+    warn "Exim main log not found. Checked: /var/log/exim_mainlog and /var/log/exim/mainlog"
+else
+    # Top authenticated senders
+    info "Top SMTP authenticated senders (last 2000 log lines):"
+    echo ""
+    printf "  ${B}%-6s %-40s %-20s${N}\n" "COUNT" "EMAIL" "cPANEL ACCOUNT"
+    echo "  ──────────────────────────────────────────────────────────────────────"
+    tail -2000 "$EXIM_LOG" 2>/dev/null | \
+        grep -E "A=dovecot_plain|A=plain|A=login|authenticated" | \
+        grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | \
+        sort | uniq -c | sort -rn | head -12 | \
+        while read -r cnt email; do
+            ACCT=$(_email_to_cpanel "$email")
+            CLR=$N; FLAG=""
+            [ "$cnt" -ge 200 ] && CLR=$R && FLAG=" ◄ CREDENTIAL ABUSE"
+            [ "$cnt" -ge 50  ] && [ "$cnt" -lt 200 ] && CLR=$Y && FLAG=" ◄ HIGH VOLUME"
+            [ -n "$TARGET_USER" ] && [ "$ACCT" != "$TARGET_USER" ] && continue
+            printf "${CLR}  %-6s %-40s %-20s%s${N}\n" \
+                "$cnt" "$email" "$ACCT" "$FLAG"
         done
-}
 
-# =============================================================================
-# SECTION 7 — Blacklist check for server IP
-# =============================================================================
-section_blacklist_check() {
-    section "7. SERVER IP BLACKLIST CHECK"
+    # Auth failures
     echo ""
-
-    _sbuf ""
-    _sbuf "=== BLACKLIST CHECK ==="
-
-    # Get main outbound IP
-    local server_ip
-    server_ip=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || \
-                hostname -I | awk '{print $1}')
-
-    log_info "Checking server IP: ${server_ip}"
-    echo ""
-
-    if [ -z "$server_ip" ]; then
-        log_warn "Could not determine server IP."
-        return
+    AUTH_FAILS=$(tail -2000 "$EXIM_LOG" 2>/dev/null | \
+                 grep -cE "authenticator failed|535 " || echo 0)
+    if [ "${AUTH_FAILS:-0}" -ge 50 ]; then
+        crit "SMTP auth failures in last 2000 lines: ${AUTH_FAILS} — possible credential stuffing"
+    elif [ "${AUTH_FAILS:-0}" -ge 10 ]; then
+        warn "SMTP auth failures: ${AUTH_FAILS}"
+    else
+        ok   "SMTP auth failures: ${AUTH_FAILS} (normal)"
     fi
 
-    # Reverse the IP for DNSBL lookups
-    local reversed_ip
-    reversed_ip=$(echo "$server_ip" | awk -F. '{print $4"."$3"."$2"."$1}')
+    # Top IPs with auth failures
+    echo ""
+    info "IPs with most SMTP auth failures:"
+    tail -2000 "$EXIM_LOG" 2>/dev/null | \
+        grep -E "authenticator failed|535 " | \
+        grep -oE '\[([0-9]{1,3}\.){3}[0-9]{1,3}\]' | tr -d '[]' | \
+        sort | uniq -c | sort -rn | head -8 | \
+        while read -r cnt ip; do
+            printf "    %-6s %s\n" "$cnt" "$ip"
+        done
+fi
 
-    # Common DNSBLs
-    local -a dnsbls=(
+# =============================================================================
+# SECTION 7 — Server IP blacklist check (DNSBL)
+# =============================================================================
+hdr "7. SERVER IP BLACKLIST CHECK (DNSBL)"
+echo ""
+
+SERVER_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || \
+            curl -s --max-time 5 icanhazip.com 2>/dev/null || \
+            hostname -I | awk '{print $1}')
+
+if [ -z "$SERVER_IP" ]; then
+    warn "Could not determine server IP — skipping blacklist check."
+else
+    info "Server outbound IP: ${SERVER_IP}"
+    echo ""
+
+    REVERSED_IP=$(echo "$SERVER_IP" | awk -F. '{print $4"."$3"."$2"."$1}')
+
+    declare -a DNSBLS=(
         "zen.spamhaus.org"
         "bl.spamcop.net"
         "dnsbl.sorbs.net"
@@ -471,378 +396,286 @@ section_blacklist_check() {
         "psbl.surriel.com"
     )
 
-    local listed_count=0
-    printf "${C_BOLD}  %-40s %s${C_RESET}\n" "DNSBL" "STATUS"
-    echo "  ──────────────────────────────────────────────────"
+    LISTED=0
+    printf "  ${B}%-40s %-s${N}\n" "DNSBL" "STATUS"
+    echo "  ──────────────────────────────────────────────────────────────────────"
 
-    for dnsbl in "${dnsbls[@]}"; do
-        local lookup="${reversed_ip}.${dnsbl}"
-        local result
-        result=$(host -t A "$lookup" 2>/dev/null | grep "has address")
-
-        if [ -n "$result" ]; then
-            printf "  ${C_RED}%-40s LISTED ◄${C_RESET}\n" "$dnsbl"
-            _sbuf "  BLACKLISTED on: $dnsbl"
-            listed_count=$((listed_count + 1))
+    for DNSBL in "${DNSBLS[@]}"; do
+        RESULT=$(host -t A "${REVERSED_IP}.${DNSBL}" 2>/dev/null | grep "has address")
+        if [ -n "$RESULT" ]; then
+            printf "  ${R}%-40s LISTED ◄${N}\n" "$DNSBL"
+            LISTED=$((LISTED + 1))
         else
-            printf "  ${C_GREEN}%-40s clean${C_RESET}\n" "$dnsbl"
+            printf "  ${G}%-40s clean${N}\n" "$DNSBL"
         fi
     done
 
     echo ""
-    if [ "$listed_count" -gt 0 ]; then
-        log_crit "Server IP is listed on ${listed_count} DNSBL(s) — delist immediately"
-        log_warn "  Spamhaus delist : https://www.spamhaus.org/lookup/"
-        log_warn "  SpamCop delist  : https://www.spamcop.net/bl.shtml"
-        log_warn "  Barracuda delist: https://www.barracudacentral.org/rbl/removal-request"
-        _sbuf "LISTED ON $listed_count DNSBLS — delist urgently"
+    if [ "$LISTED" -gt 0 ]; then
+        crit "IP is listed on ${LISTED} DNSBL(s) — delist AFTER stopping spam source"
+        warn "  Spamhaus : https://www.spamhaus.org/lookup/"
+        warn "  SpamCop  : https://www.spamcop.net/bl.shtml"
+        warn "  Barracuda: https://www.barracudacentral.org/rbl/removal-request"
     else
-        log_ok "Server IP is not listed on any checked DNSBL."
-        _sbuf "IP clean on all checked DNSBLs."
+        ok "Server IP is clean on all checked DNSBLs."
     fi
-}
+fi
 
 # =============================================================================
-# SECTION 8 — ACTION MENU (all actions require confirmation)
+# SECTION 8 — Action menu
 # =============================================================================
-section_action_menu() {
-    section "8. ADMIN ACTION MENU"
+hdr "8. ADMIN ACTIONS"
+echo ""
+
+if [ -z "$TARGET_USER" ] && [ -z "$ACTION" ]; then
+    info "No action specified. Available actions (require --user):"
     echo ""
-
-    if [ -z "$TARGET_USER" ] && [ -z "$ACTION" ]; then
-        log_dim "Run with --user <account> --action <action> to take action."
-        log_dim "Available actions:"
-        echo ""
-        printf "  ${C_BOLD}%-20s %-s${C_RESET}\n" "ACTION" "WHAT IT DOES"
-        echo "  ──────────────────────────────────────────────────"
-        printf "  %-20s %-s\n" "freeze"    "Freeze all queued messages for account (stops sending)"
-        printf "  %-20s %-s\n" "unfreeze"  "Unfreeze messages (resume sending)"
-        printf "  %-20s %-s\n" "remove"    "DELETE all queued messages for account (irreversible)"
-        printf "  %-20s %-s\n" "block"     "Block outbound email for account via Exim ACL / CSF"
-        printf "  %-20s %-s\n" "suspend"   "Suspend cPanel account entirely (WHM API)"
-        printf "  %-20s %-s\n" "report"    "Show full message list for account"
-        echo ""
-        log_dim "Example: bash mail_investigate.sh --user johndoe --action freeze"
-        return
-    fi
-
-    [ -z "$TARGET_USER" ] && {
-        log_warn "Specify --user <account> to perform an action."
-        return
-    }
-
-    log_info "Target account : ${TARGET_USER}"
-    log_info "Action         : ${ACTION}"
-
-    # Count messages for this account
-    local account_msg_count
-    account_msg_count=$(exim -bp 2>/dev/null | \
-        grep -A2 "" | \
-        awk -v user="$TARGET_USER" '
-            /<[^>]*@/ {
-                split($0, a, "<"); split(a[2], b, "@");
-                split(b[2], c, ">");
-                domain = c[1]
-            }
-            /[0-9a-zA-Z]{16}/ { msgid = $3 }
-        ' | wc -l || echo 0)
-
-    # Simpler count via grep on domain
-    local user_domain
-    user_domain=$(grep -i "^[^:]*:.*${TARGET_USER}$" /etc/userdomains 2>/dev/null | \
-                  awk '{print $1}' | tr -d ':' | head -1)
-
+    printf "  ${B}%-12s %-s${N}\n" "ACTION" "WHAT IT DOES"
+    echo "  ──────────────────────────────────────────────────────────────────────"
+    printf "  %-12s %-s\n" "report"   "Show full queue listing for account"
+    printf "  %-12s %-s\n" "freeze"   "Freeze all queued messages (stops sending)"
+    printf "  %-12s %-s\n" "unfreeze" "Unfreeze messages (resume delivery)"
+    printf "  %-12s %-s\n" "remove"   "DELETE all queued messages for account ⚠"
+    printf "  %-12s %-s\n" "block"    "Block outbound email (Exim ACL / CSF / WHM)"
+    printf "  %-12s %-s\n" "suspend"  "Suspend entire cPanel account via WHM API"
     echo ""
+    info "Example: bash mail_investigate.sh --user johndoe --action freeze"
+elif [ -n "$ACTION" ] && [ -z "$TARGET_USER" ]; then
+    warn "--action requires --user to be specified."
+    info "Example: bash mail_investigate.sh --user johndoe --action ${ACTION}"
+else
+    USER_DOMAIN=$(_user_to_domain "$TARGET_USER")
+    info "Account : ${TARGET_USER}"
+    info "Domain  : ${USER_DOMAIN:-not found}"
+    info "Action  : ${ACTION}"
 
     case "$ACTION" in
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
+        report)
+            echo ""
+            info "Full queue listing for ${TARGET_USER} / ${USER_DOMAIN}:"
+            echo ""
+            exim -bp 2>/dev/null | grep -A3 \
+                "${TARGET_USER}\|${USER_DOMAIN}" | head -80
+            ;;
+
+        # -------------------------------------------------------------------
         freeze)
-            log_warn "Will FREEZE all queued messages for: ${TARGET_USER}"
-            [ -n "$user_domain" ] && \
-                log_dim "  Domain: $user_domain"
-
-            if _confirm "Freeze all outgoing mail for ${TARGET_USER}?"; then
-                local frozen=0
-                for msg_id in $(exim -bp 2>/dev/null | \
-                    awk '/^\s*[0-9]+[smhdw]/{print $3}'); do
-                    local sender
-                    sender=$(exim -Mvh "$msg_id" 2>/dev/null | \
-                             grep -i "^return-path:" | \
-                             grep -i "@${user_domain}" | head -1)
-                    if [ -n "$sender" ] || \
-                       exim -Mvh "$msg_id" 2>/dev/null | \
-                           grep -qi "${TARGET_USER}"; then
-                        exim -Mf "$msg_id" 2>/dev/null && \
-                            frozen=$((frozen + 1))
-                    fi
+            warn "Will FREEZE all queued messages for: ${TARGET_USER}"
+            if _confirm "Freeze outgoing mail for ${TARGET_USER}?"; then
+                FROZEN=0
+                for MSG_ID in $(exim -bp 2>/dev/null | \
+                    awk '/^\s+[0-9]+[smhdw]/{print $3}'); do
+                    exim -Mvh "$MSG_ID" 2>/dev/null | \
+                        grep -qi "${TARGET_USER}\|${USER_DOMAIN}" && {
+                        exim -Mf "$MSG_ID" 2>/dev/null && \
+                            FROZEN=$((FROZEN + 1))
+                    }
                 done
-                log_ok "Frozen ${frozen} messages for ${TARGET_USER}."
-                write_log "mail_investigate" \
-                    "ACTION: Froze $frozen messages for $TARGET_USER"
+                ok "Frozen ${FROZEN} messages for ${TARGET_USER}."
             else
-                log_info "Action cancelled."
+                info "Action cancelled."
             fi
             ;;
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         unfreeze)
-            log_info "Will UNFREEZE queued messages for: ${TARGET_USER}"
-            if _confirm "Unfreeze and resume sending for ${TARGET_USER}?"; then
-                local thawed=0
-                for msg_id in $(exim -bp 2>/dev/null | grep frozen | \
+            info "Will UNFREEZE queued messages for: ${TARGET_USER}"
+            if _confirm "Unfreeze and resume delivery for ${TARGET_USER}?"; then
+                THAWED=0
+                for MSG_ID in $(exim -bp 2>/dev/null | grep frozen | \
                     awk '{print $3}'); do
-                    exim -Mvh "$msg_id" 2>/dev/null | \
-                        grep -qi "${TARGET_USER}" && {
-                        exim -Mt "$msg_id" 2>/dev/null && \
-                            thawed=$((thawed + 1))
+                    exim -Mvh "$MSG_ID" 2>/dev/null | \
+                        grep -qi "${TARGET_USER}\|${USER_DOMAIN}" && {
+                        exim -Mt "$MSG_ID" 2>/dev/null && \
+                            THAWED=$((THAWED + 1))
                     }
                 done
-                log_ok "Unfrozen ${thawed} messages for ${TARGET_USER}."
-                write_log "mail_investigate" \
-                    "ACTION: Unfroze $thawed messages for $TARGET_USER"
+                ok "Unfrozen ${THAWED} messages for ${TARGET_USER}."
             else
-                log_info "Action cancelled."
+                info "Action cancelled."
             fi
             ;;
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         remove)
-            log_crit "Will PERMANENTLY DELETE all queued mail for: ${TARGET_USER}"
-            log_crit "THIS CANNOT BE UNDONE."
+            crit "Will PERMANENTLY DELETE all queued mail for: ${TARGET_USER}"
+            crit "THIS CANNOT BE UNDONE."
             if _confirm "PERMANENTLY DELETE queued mail for ${TARGET_USER}?"; then
-                local removed=0
-                for msg_id in $(exim -bp 2>/dev/null | \
-                    awk '/^\s*[0-9]+[smhdw]/{print $3}'); do
-                    exim -Mvh "$msg_id" 2>/dev/null | \
-                        grep -qi "${TARGET_USER}" && {
-                        exim -Mrm "$msg_id" 2>/dev/null && \
-                            removed=$((removed + 1))
+                REMOVED=0
+                for MSG_ID in $(exim -bp 2>/dev/null | \
+                    awk '/^\s+[0-9]+[smhdw]/{print $3}'); do
+                    exim -Mvh "$MSG_ID" 2>/dev/null | \
+                        grep -qi "${TARGET_USER}\|${USER_DOMAIN}" && {
+                        exim -Mrm "$MSG_ID" 2>/dev/null && \
+                            REMOVED=$((REMOVED + 1))
                     }
                 done
-                log_ok "Removed ${removed} messages for ${TARGET_USER}."
-                write_log "mail_investigate" \
-                    "ACTION: Removed $removed messages for $TARGET_USER"
+                ok "Removed ${REMOVED} messages for ${TARGET_USER}."
             else
-                log_info "Action cancelled."
+                info "Action cancelled."
             fi
             ;;
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         block)
             echo ""
-            log_warn "Block options for ${TARGET_USER}:"
+            warn "Block options for ${TARGET_USER} (${USER_DOMAIN}):"
             echo ""
-            printf "  ${C_BOLD}[1]${C_RESET} Block via Exim sender ACL (blocks SMTP outbound only)\n"
-            printf "  ${C_BOLD}[2]${C_RESET} Block via CSF (blocks all outbound port 25/465/587)\n"
-            printf "  ${C_BOLD}[3]${C_RESET} Disable cPanel email routing entirely (WHM API)\n"
-            printf "  ${C_BOLD}[4]${C_RESET} Cancel\n"
+            printf "  ${B}[1]${N} Block via Exim sender ACL (/etc/blockedsenders)\n"
+            printf "  ${B}[2]${N} Block SMTP ports via CSF (port 25/465/587 for UID)\n"
+            printf "  ${B}[3]${N} Disable email routing via WHM API\n"
+            printf "  ${B}[4]${N} Cancel\n"
             echo ""
             echo -ne "  Choose [1-4]: "
-            read -r block_choice
+            read -r CHOICE
 
-            case "$block_choice" in
+            case "$CHOICE" in
                 1)
-                    log_info "Adding ${TARGET_USER} to Exim sender block list..."
-                    if _confirm "Add to /etc/blockedsenders (Exim deny list)?"; then
-                        echo "*@${user_domain}" >> /etc/blockedsenders
-                        # Reload Exim
+                    if _confirm "Add *@${USER_DOMAIN} to /etc/blockedsenders?"; then
+                        echo "*@${USER_DOMAIN}" >> /etc/blockedsenders
                         /scripts/restartsrv_exim &>/dev/null || \
                             service exim restart &>/dev/null
-                        log_ok "Domain ${user_domain} added to /etc/blockedsenders"
-                        log_dim "  To remove: edit /etc/blockedsenders and restart Exim"
-                        write_log "mail_investigate" \
-                            "ACTION: Blocked $user_domain in Exim sender ACL"
+                        ok "Added *@${USER_DOMAIN} to /etc/blockedsenders. Exim restarted."
+                        info "To remove: edit /etc/blockedsenders and restart Exim"
                     fi
                     ;;
                 2)
-                    log_info "Blocking outbound port 25/465/587 for ${TARGET_USER} via CSF..."
                     if command -v csf &>/dev/null; then
-                        if _confirm "Block SMTP ports for UID of ${TARGET_USER}?"; then
-                            local uid
-                            uid=$(id -u "$TARGET_USER" 2>/dev/null)
-                            if [ -n "$uid" ]; then
-                                # Add UID-based outbound block in CSF
-                                echo "SMTP_BLOCK_UID = ${uid}" >> \
-                                    /etc/csf/csf.conf
-                                csf -r &>/dev/null
-                                log_ok "SMTP ports blocked for UID ${uid} (${TARGET_USER}) via CSF"
-                                write_log "mail_investigate" \
-                                    "ACTION: CSF SMTP block for UID $uid ($TARGET_USER)"
-                            else
-                                log_warn "Could not determine UID for ${TARGET_USER}"
+                        UID_NUM=$(id -u "$TARGET_USER" 2>/dev/null)
+                        if [ -n "$UID_NUM" ]; then
+                            if _confirm "Block SMTP ports for UID ${UID_NUM} (${TARGET_USER}) via CSF?"; then
+                                # CSF SMTP_ALLOWLOCAL_PORTS blocks per-uid outbound
+                                echo ""
+                                info "Adding to CSF — editing /etc/csf/csf.conf..."
+                                # Safer: use csf allow/deny or LF_SCRIPT_ALERT
+                                warn "Manual step: In /etc/csf/csf.conf set:"
+                                warn "  SMTP_BLOCK = 1"
+                                warn "  SMTP_ALLOWEDPORTS = 25,465,587"
+                                warn "Then add UID ${UID_NUM} to SMTP_BLOCK_EXCEPTIONS exceptions list (inverted)"
+                                warn "Or use: csf --deny <IP> for attacker IP blocking"
+                                info "Restarting CSF after changes: csf -r"
                             fi
+                        else
+                            warn "Could not find UID for ${TARGET_USER}"
                         fi
                     else
-                        log_warn "CSF not found. Use --action block with WHM or Exim instead."
+                        warn "CSF not found — use Exim ACL or WHM option instead."
                     fi
                     ;;
                 3)
-                    log_info "Disabling email routing for ${TARGET_USER} via WHM API..."
-                    if _confirm "Disable email routing for ${TARGET_USER}?"; then
-                        local api_result
-                        api_result=$(whm_api "disableemaildomains" \
-                                     "domain=${user_domain}")
-                        if echo "$api_result" | grep -q '"status":1'; then
-                            log_ok "Email routing disabled for ${user_domain} via WHM API"
-                            write_log "mail_investigate" \
-                                "ACTION: WHM email routing disabled for $TARGET_USER"
+                    if _confirm "Disable email routing for ${USER_DOMAIN} via WHM API?"; then
+                        WHM_TOKEN=$(cat /etc/wwwacct.conf 2>/dev/null | \
+                                    grep -i "api_token" | awk '{print $2}')
+                        RESULT=$(curl -sk \
+                            -H "Authorization: whm root:${WHM_TOKEN}" \
+                            "https://localhost:2087/json-api/disableemaildomains?api.version=1&domain=${USER_DOMAIN}" \
+                            2>/dev/null)
+                        if echo "$RESULT" | grep -q '"status":1'; then
+                            ok "Email routing disabled for ${USER_DOMAIN}"
                         else
-                            log_warn "WHM API call may have failed — check manually in WHM"
-                            log_dim "  API response: $(echo "$api_result" | head -c 200)"
+                            warn "WHM API response unclear — verify in WHM manually"
+                            info "WHM → Email → MX Entry → set to Remote Mail Exchanger"
                         fi
                     fi
                     ;;
-                4)
-                    log_info "Block action cancelled."
-                    ;;
+                4) info "Block cancelled." ;;
+                *) warn "Invalid choice." ;;
             esac
             ;;
 
-        # ---------------------------------------------------------------
+        # -------------------------------------------------------------------
         suspend)
-            log_crit "Will SUSPEND cPanel account: ${TARGET_USER}"
-            log_warn "This disables the entire account, not just email."
+            crit "Will SUSPEND entire cPanel account: ${TARGET_USER}"
+            warn "This disables ALL services for the account, not just email."
             if _confirm "SUSPEND account ${TARGET_USER} via WHM?"; then
-                local api_result
-                api_result=$(whm_api "suspendacct" \
-                             "user=${TARGET_USER}&reason=Spam+investigation")
-                if echo "$api_result" | grep -q '"status":1\|suspended'; then
-                    log_ok "Account ${TARGET_USER} suspended via WHM API."
-                    write_log "mail_investigate" \
-                        "ACTION: Suspended account $TARGET_USER via WHM"
+                RESULT=$(whmapi1 suspendacct \
+                    user="${TARGET_USER}" \
+                    reason="Spam investigation $(date +%Y-%m-%d)" \
+                    2>/dev/null)
+                if echo "$RESULT" | grep -q "result: 1\|suspended"; then
+                    ok "Account ${TARGET_USER} suspended."
                 else
-                    log_warn "WHM API response unclear — verify in WHM manually"
-                    log_dim "$(echo "$api_result" | head -c 200)"
+                    warn "whmapi1 response unclear — verify in WHM → Account Functions → Suspend"
                 fi
             else
-                log_info "Suspend cancelled."
+                info "Suspend cancelled."
             fi
             ;;
 
-        # ---------------------------------------------------------------
-        report)
-            section "FULL QUEUE LISTING — ${TARGET_USER}"
-            echo ""
-            exim -bp 2>/dev/null | grep -A3 "${TARGET_USER}\|${user_domain}" | \
-                head -100
-            ;;
-
         *)
-            log_warn "Unknown action: ${ACTION}"
-            log_dim "Valid: freeze | unfreeze | remove | block | suspend | report"
+            warn "Unknown action: ${ACTION}"
+            info "Valid: report | freeze | unfreeze | remove | block | suspend"
             ;;
     esac
-}
+fi
 
 # =============================================================================
-# SECTION 9 — Recommendations
+# SECTION 9 — Recommendations & one-liners
 # =============================================================================
-section_recommendations() {
-    section "9. RECOMMENDATIONS"
-    echo ""
+hdr "9. RECOMMENDATIONS & QUICK REFERENCE"
+echo ""
 
-    _sbuf ""
-    _sbuf "=== RECOMMENDATIONS ==="
+echo -e "  ${B}Immediate Actions (if spam confirmed):${N}"
+echo ""
+echo -e "  ${C}1.${N} Identify culprit → Section 2 (top senders) or Section 4 (PHP script)"
+echo -e "  ${C}2.${N} Freeze queue first → bash mail_investigate.sh --user <acct> --action freeze"
+echo -e "  ${C}3.${N} If PHP script: delete/quarantine it, change account password"
+echo -e "  ${C}4.${N} If SMTP credential abuse: reset email password in cPanel immediately"
+echo -e "  ${C}5.${N} Remove spam from queue → --action remove (after freeze + confirm it's spam)"
+echo -e "  ${C}6.${N} Delist IP ONLY after spam source is stopped — not before"
+echo ""
 
-    echo -e "  ${C_BOLD}Immediate Actions (if spam detected):${C_RESET}"
-    echo ""
-    printf "  ${C_CYAN}%-5s${C_RESET} %-s\n" "1." \
-        "Identify top sender with --action report, freeze with --action freeze"
-    printf "  ${C_CYAN}%-5s${C_RESET} %-s\n" "2." \
-        "If PHP script found: delete/quarantine the script, change account password"
-    printf "  ${C_CYAN}%-5s${C_RESET} %-s\n" "3." \
-        "If SMTP credential abuse: reset email password immediately via cPanel"
-    printf "  ${C_CYAN}%-5s${C_RESET} %-s\n" "4." \
-        "Remove spam from queue: --action remove (after freezing, confirm queue is spam)"
-    printf "  ${C_CYAN}%-5s${C_RESET} %-s\n" "5." \
-        "If IP blacklisted: delist AFTER source is stopped, not before"
+echo -e "  ${B}Preventive Hardening (WHM / Exim / CSF):${N}"
+echo ""
+echo -e "  ${D}•${N} WHM → Exim Config → Max hourly emails per domain (e.g. 300/hr)"
+echo -e "  ${D}•${N} WHM → Exim Config → Require HELO before MAIL + Require valid HELO"
+echo -e "  ${D}•${N} CSF → SMTP_BLOCK=1 (blocks non-Exim SMTP from user processes)"
+echo -e "  ${D}•${N} CSF → LF_SCRIPT_ALERT=1 (alert when script sends too many mails)"
+echo -e "  ${D}•${N} Imunify360 → Enable Proactive Defense (blocks webshells)"
+echo -e "  ${D}•${N} Ensure SPF, DKIM, DMARC are set for all hosted domains"
+echo ""
 
-    echo ""
-    echo -e "  ${C_BOLD}Preventive Hardening (Exim / cPanel):${C_RESET}"
-    echo ""
-    printf "  ${C_DIM}%-5s${C_RESET} %-s\n" "•" \
-        "WHM → Exim Config → Set hourly outbound relay limit per domain (e.g. 300/hr)"
-    printf "  ${C_DIM}%-5s${C_RESET} %-s\n" "•" \
-        "WHM → Exim Config → Enable 'Count mailman deliveries against sender' limits"
-    printf "  ${C_DIM}%-5s${C_RESET} %-s\n" "•" \
-        "WHM → Exim Config → Enable 'Require HELO before MAIL' + 'Require valid HELO'"
-    printf "  ${C_DIM}%-5s${C_RESET} %-s\n" "•" \
-        "CSF: Set SMTP_BLOCK=1 to prevent non-Exim SMTP outbound from user processes"
-    printf "  ${C_DIM}%-5s${C_RESET} %-s\n" "•" \
-        "CSF: Set LF_SCRIPT_ALERT=1 to alert when a script sends >LF_SCRIPT_LIMIT mails"
-    printf "  ${C_DIM}%-5s${C_RESET} %-s\n" "•" \
-        "Imunify360: Enable proactive defense to block webshell/dropper execution"
-    printf "  ${C_DIM}%-5s${C_RESET} %-s\n" "•" \
-        "Enable SPF, DKIM, and DMARC for all hosted domains"
-    printf "  ${C_DIM}%-5s${C_RESET} %-s\n" "•" \
-        "Consider Mailchannels or outbound relay filtering for high-volume shared servers"
+sep
+echo -e "${B}  QUICK REFERENCE ONE-LINERS${N}"
+sep
+echo ""
+echo -e "  ${D}# Total queue count:${N}"
+echo    "  exim -bpc"
+echo ""
+echo -e "  ${D}# Full queue listing:${N}"
+echo    "  exim -bp | head -50"
+echo ""
+echo -e "  ${D}# Top senders in queue:${N}"
+echo    "  exim -bp | grep -oE '<[^>]+>' | tr -d '<>' | sort | uniq -c | sort -rn | head -20"
+echo ""
+echo -e "  ${D}# Flush/retry all deferred:${N}"
+echo    "  exim -qff"
+echo ""
+echo -e "  ${D}# Remove ALL frozen messages (careful!):${N}"
+echo    "  exiqgrep -z -i | xargs exim -Mrm"
+echo ""
+echo -e "  ${D}# Remove all messages from one sender:${N}"
+echo    "  exiqgrep -f 'user@domain.com' -i | xargs exim -Mrm"
+echo ""
+echo -e "  ${D}# Remove all messages TO one recipient domain:${N}"
+echo    "  exiqgrep -r '@domain.com' -i | xargs exim -Mrm"
+echo ""
+echo -e "  ${D}# View message header:${N}"
+echo    "  exim -Mvh <message-id>"
+echo ""
+echo -e "  ${D}# View message body:${N}"
+echo    "  exim -Mvb <message-id>"
+echo ""
+echo -e "  ${D}# Check if your IP is in Spamhaus:${N}"
+echo    "  host \$(curl -s ifconfig.me | awk -F. '{print \$4\".\"\$3\".\"\$2\".\"\$1}').zen.spamhaus.org"
+echo ""
+echo -e "  ${D}# Suspend account via WHM CLI:${N}"
+echo    "  whmapi1 suspendacct user=<username> reason='Spam'"
+echo ""
 
-    echo ""
-    echo -e "  ${C_BOLD}Useful one-liners (run as root):${C_RESET}"
-    echo ""
-    echo -e "  ${C_DIM}# Count queue${C_RESET}"
-    echo    "  exim -bpc"
-    echo ""
-    echo -e "  ${C_DIM}# View full queue${C_RESET}"
-    echo    "  exim -bp"
-    echo ""
-    echo -e "  ${C_DIM}# Flush/retry all deferred messages${C_RESET}"
-    echo    "  exim -qff"
-    echo ""
-    echo -e "  ${C_DIM}# Remove ALL frozen messages (use with care)${C_RESET}"
-    echo    "  exiqgrep -z -i | xargs exim -Mrm"
-    echo ""
-    echo -e "  ${C_DIM}# Remove all messages from a specific sender${C_RESET}"
-    echo    "  exiqgrep -f 'user@domain.com' -i | xargs exim -Mrm"
-    echo ""
-    echo -e "  ${C_DIM}# View a specific message header${C_RESET}"
-    echo    "  exim -Mvh <message-id>"
-    echo ""
-    echo -e "  ${C_DIM}# View message body${C_RESET}"
-    echo    "  exim -Mvb <message-id>"
-    echo ""
-    echo -e "  ${C_DIM}# Test if IP is in Spamhaus${C_RESET}"
-    echo    "  host <reversed-ip>.zen.spamhaus.org"
-
-    _sbuf "Recommendations listed above."
-}
-
-# =============================================================================
-# MAIN
-# =============================================================================
-main() {
-    header "MAIL QUEUE INVESTIGATION REPORT"
-    write_log "mail_investigate" "Mail investigation started"
-
-    [ -n "$TARGET_USER" ] && log_info "Account filter: ${TARGET_USER}"
-
-    section_queue_overview
-    section_top_senders
-    section_top_recipients
-    section_sample_inspection
-    section_php_origination
-    section_smtp_auth_abuse
-    section_blacklist_check
-
-    # Only show action menu if --action or if no filter (show help)
-    if [ -n "$ACTION" ] || [ -z "$TARGET_USER" ]; then
-        section_action_menu
-    fi
-
-    section_recommendations
-
-    echo ""
-    section "INVESTIGATION COMPLETE"
-    log_info "Log: ${LOG_DIR}/mail_investigate.log"
-    write_log "mail_investigate" "Mail investigation complete"
-
-    if [ "$POST_SLACK" = true ]; then
-        slack_post "Mail Queue Investigation" "$SLACK_BUFFER"
-        log_info "Findings posted to Slack."
-    else
-        log_dim "Tip: run with --slack to post findings to Slack"
-    fi
-}
-
-main "$@"
+sep
+echo -e "${G}${B}  Done — $(date '+%H:%M:%S')${N}"
+sep
+echo ""

@@ -1,421 +1,364 @@
 #!/bin/bash
 # =============================================================================
-# /opt/hostmon/cpu_investigate.sh
-# =============================================================================
-# PURPOSE: When Zabbix fires a CPU spike alert, run this to find out:
-#   - Which processes are consuming CPU
-#   - Which cPanel account owns them
-#   - Whether it looks like abuse, an attack, or legitimate load
-#   - What PHP/MySQL/Apache workers are doing
+# cpu_investigate.sh — Self-contained CPU Investigation
+# Drop anywhere, run as root. No external dependencies.
 #
 # USAGE:
-#   bash cpu_investigate.sh               # Full investigation
-#   bash cpu_investigate.sh --user joe    # Focus on specific cPanel account
-#   bash cpu_investigate.sh --slack       # Also post findings to Slack
+#   bash cpu_investigate.sh
+#   bash cpu_investigate.sh --user sorre657
+#   bash cpu_investigate.sh --top 20
 # =============================================================================
 
-HOSTMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${HOSTMON_DIR}/lib/common.sh"
-require_root
-require_cmds ps awk grep curl
-
-# Parse args
 TARGET_USER=""
-POST_SLACK=false
+TOP_COUNT=15
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
-        --user)   TARGET_USER="$2"; shift ;;
-        --slack)  POST_SLACK=true ;;
-        *)        ;;
+        --user) TARGET_USER="$2"; shift ;;
+        --top)  TOP_COUNT="$2";   shift ;;
     esac
     shift
 done
 
-SLACK_BUFFER=""
-_sbuf() { SLACK_BUFFER+="$*"$'\n'; }
+# --- Colors
+R='\033[0;31m'; Y='\033[1;33m'; G='\033[0;32m'
+C='\033[0;36m'; B='\033[1m';    D='\033[2m'; N='\033[0m'
+
+# --- Root check
+if [ "$EUID" -ne 0 ]; then
+    echo "Run as root." >&2
+    exit 1
+fi
+
+sep()  { echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"; }
+hdr()  { echo ""; sep; echo -e "${B}  $*${N}"; sep; }
+info() { echo -e "  ${C}•${N} $*"; }
+warn() { echo -e "  ${Y}▲${N} $*"; }
+crit() { echo -e "  ${R}✖${N} $*"; }
+ok()   { echo -e "  ${G}✔${N} $*"; }
+
+HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+CPU_CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo)
+read LOAD1 LOAD5 LOAD15 _ < /proc/loadavg
+
+echo ""
+echo -e "${B}╔══════════════════════════════════════════════════════════════╗${N}"
+echo -e "${B}  CPU INVESTIGATION — ${HOSTNAME}${N}"
+echo -e "${D}  $(date '+%Y-%m-%d %H:%M:%S')  |  Cores: ${CPU_CORES}  |  Load: ${LOAD1} ${LOAD5} ${LOAD15}${N}"
+echo -e "${B}╚══════════════════════════════════════════════════════════════╝${N}"
+
+LOAD1_INT=${LOAD1%.*}
+LOAD_COLOR=$G
+[ "${LOAD1_INT:-0}" -ge "$CPU_CORES" ]                && LOAD_COLOR=$Y
+[ "${LOAD1_INT:-0}" -ge $(( CPU_CORES * 2 )) ]        && LOAD_COLOR=$R
+echo -e "\n  Load average: ${LOAD_COLOR}${LOAD1} (1m)  ${LOAD5} (5m)  ${LOAD15} (15m)${N}  on ${CPU_CORES} cores"
 
 # =============================================================================
-# SECTION 1 — SNAPSHOT: Top CPU processes right now
+# SECTION 1 — top -c style: full command, sorted by CPU
 # =============================================================================
-section_top_processes() {
-    section "1. TOP CPU-CONSUMING PROCESSES (live snapshot)"
+hdr "1. TOP PROCESSES BY CPU  (top -c style)"
+echo ""
+printf "${B}  %-7s %-14s %5s %5s %9s  %-s${N}\n" \
+    "PID" "USER" "%CPU" "%MEM" "ELAPSED" "COMMAND (full)"
+echo "  ────────────────────────────────────────────────────────────────────"
+
+PS_OUTPUT=$(ps aux --sort=-%cpu 2>/dev/null | awk 'NR>1')
+[ -n "$TARGET_USER" ] && PS_OUTPUT=$(echo "$PS_OUTPUT" | grep "^${TARGET_USER} ")
+
+echo "$PS_OUTPUT" | head -"$TOP_COUNT" | \
+while IFS= read -r line; do
+    PID=$(echo "$line" | awk '{print $2}')
+    USR=$(echo "$line" | awk '{print $1}')
+    CPU=$(echo "$line" | awk '{print $3}')
+    MEM=$(echo "$line" | awk '{print $4}')
+
+    # Process age from /proc
+    ELAPSED="?"
+    if [ -f "/proc/$PID/stat" ]; then
+        START=$(awk '{print $22}' /proc/$PID/stat 2>/dev/null)
+        UPTIME_S=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+        HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
+        if [ -n "$START" ] && [ -n "$UPTIME_S" ] && [ "$HZ" -gt 0 ]; then
+            AGE=$(( UPTIME_S - START/HZ ))
+            if   [ "$AGE" -ge 3600 ]; then ELAPSED="$(( AGE/3600 ))h$(( (AGE%3600)/60 ))m"
+            elif [ "$AGE" -ge 60 ];   then ELAPSED="$(( AGE/60 ))m$(( AGE%60 ))s"
+            else                           ELAPSED="${AGE}s"
+            fi
+        fi
+    fi
+
+    # Full cmdline for context (shows script path like lsphp shows wp-cron.php)
+    CMD=$(cat /proc/$PID/cmdline 2>/dev/null | tr '\0' ' ' | sed 's/  */ /g' | cut -c1-65)
+    [ -z "$CMD" ] && CMD=$(echo "$line" | awk '{for(i=11;i<=NF;i++) printf $i" "; print ""}')
+
+    CPU_I=${CPU%.*}
+    CLR=$N
+    [ "${CPU_I:-0}" -ge 50 ] && CLR=$R
+    [ "${CPU_I:-0}" -ge 20 ] && [ "${CPU_I:-0}" -lt 50 ] && CLR=$Y
+
+    CPANEL_TAG=""
+    [ -f "/var/cpanel/users/${USR}" ] && CPANEL_TAG=" [cP]"
+
+    printf "${CLR}  %-7s %-14s %5s %5s %9s  %-s${N}%s\n" \
+        "$PID" "$USR" "$CPU" "$MEM" "$ELAPSED" "$CMD" "$CPANEL_TAG"
+done
+
+# =============================================================================
+# SECTION 2 — Per cPanel account CPU rollup with verdict
+# =============================================================================
+hdr "2. CPU ROLLUP BY cPANEL ACCOUNT"
+echo ""
+printf "${B}  %-20s %8s %8s %6s  %-s${N}\n" \
+    "ACCOUNT" "TOT CPU%" "TOT MEM%" "PROCS" "VERDICT"
+echo "  ────────────────────────────────────────────────────────────────────"
+
+declare -A A_CPU A_MEM A_CNT A_CMD
+
+while IFS= read -r line; do
+    USR=$(echo "$line" | awk '{print $1}')
+    CPU=$(echo "$line" | awk '{print $3}')
+    MEM=$(echo "$line" | awk '{print $4}')
+    CMD=$(echo "$line" | awk '{print $11}')
+    [ -f "/var/cpanel/users/${USR}" ] || continue
+    [ -n "$TARGET_USER" ] && [ "$USR" != "$TARGET_USER" ] && continue
+    A_CPU[$USR]=$(echo "${A_CPU[$USR]:-0} + ${CPU:-0}" | bc 2>/dev/null || echo 0)
+    A_MEM[$USR]=$(echo "${A_MEM[$USR]:-0} + ${MEM:-0}" | bc 2>/dev/null || echo 0)
+    A_CNT[$USR]=$(( ${A_CNT[$USR]:-0} + 1 ))
+    [ -z "${A_CMD[$USR]}" ] && A_CMD[$USR]="$CMD"
+done < <(ps aux | awk 'NR>1')
+
+for USR in $(for k in "${!A_CPU[@]}"; do echo "${A_CPU[$k]} $k"; done | \
+             sort -rn | awk '{print $2}' | head -15); do
+    CPU="${A_CPU[$USR]}"
+    MEM="${A_MEM[$USR]}"
+    CNT="${A_CNT[$USR]}"
+    CPU_I=${CPU%.*}
+    CLR=$G; VERDICT="Normal"
+    if   [ "${CPU_I:-0}" -ge 100 ]; then CLR=$R; VERDICT="CRITICAL — investigate now"
+    elif [ "${CPU_I:-0}" -ge 50  ]; then CLR=$Y; VERDICT="HIGH — likely issue"
+    elif [ "${CPU_I:-0}" -ge 20  ]; then CLR=$C; VERDICT="Elevated — monitor"
+    fi
+    printf "${CLR}  %-20s %8s %8s %6s  %-s${N}\n" \
+        "$USR" "${CPU}%" "${MEM}%" "$CNT" "$VERDICT"
+done
+
+# =============================================================================
+# SECTION 3 — CloudLinux LVE usage
+# =============================================================================
+hdr "3. CLOUDLINUX LVE — TOP RESOURCE CONSUMERS"
+echo ""
+
+if command -v lveinfo &>/dev/null; then
+    info "LVE historical — top CPU consumers (last 1 hour):"
+    echo ""
+    lveinfo --period=1h --by-cpu --limit=10 \
+        --show-columns=user,aCPU,mCPU,lCPU,aEP,mEP 2>/dev/null || \
+        warn "lveinfo returned no data"
+    echo ""
+fi
+
+if command -v lveps &>/dev/null; then
+    info "LVE live snapshot (lveps --show-cpu):"
+    echo ""
+    lveps --show-cpu 2>/dev/null | head -25 || warn "lveps returned no output"
+elif [ -f /var/lve/info ]; then
+    info "LVE live data (/var/lve/info):"
+    echo ""
+    printf "  ${B}%-20s %8s %8s %6s %6s${N}\n" "USER/UID" "CPU%" "MEM" "EP" "NPROC"
+    echo "  ──────────────────────────────────────────────────"
+    awk -F: 'NR>1 && $2>0 {
+        printf "  %-20s %8s %8s %6s %6s\n", $1, $2, $3, $7, $6
+    }' /var/lve/info 2>/dev/null | sort -k2 -rn | head -15
+else
+    warn "CloudLinux LVE tools not found"
+    info "Check WHM → CloudLinux → LVE Manager for per-account limits"
+fi
+
+# =============================================================================
+# SECTION 4 — Web server status + domain/account hit pattern
+# =============================================================================
+hdr "4. WEB SERVER — ACTIVE REQUESTS & DOMAIN HIT PATTERN"
+echo ""
+
+# Detect web server
+WS=""; WS_BIN=""
+if   pgrep -x lshttpd  &>/dev/null; then WS="LiteSpeed"; WS_BIN="lshttpd"
+elif pgrep -x httpd    &>/dev/null; then WS="Apache";    WS_BIN="httpd"
+elif pgrep -x apache2  &>/dev/null; then WS="Apache";    WS_BIN="apache2"
+fi
+
+if [ -n "$WS" ]; then
+    WS_PROCS=$(pgrep -c "$WS_BIN" 2>/dev/null || echo "?")
+    WS_CPU=$(ps aux | grep "$WS_BIN" | grep -v grep | \
+             awk '{sum+=$3} END {printf "%.1f", sum+0}')
+    info "Web server: ${WS} | Workers: ${WS_PROCS} | CPU: ${WS_CPU}%"
+fi
+
+# Apache mod_status
+echo ""
+info "Apache server-status:"
+ASTATUS=$(curl -sk --max-time 3 "http://127.0.0.1/server-status?auto" 2>/dev/null)
+if [ -n "$ASTATUS" ]; then
+    echo "$ASTATUS" | grep -E "BusyWorkers|IdleWorkers|ReqPerSec|Total Accesses" | \
+        while IFS= read -r l; do echo -e "    $l"; done
 
     echo ""
-    printf "${C_BOLD}%-6s %-10s %-6s %-6s %-s${C_RESET}\n" \
-        "PID" "USER" "%CPU" "%MEM" "COMMAND"
-    echo "──────────────────────────────────────────────────────────────"
+    info "Active requests right now (from server-status):"
+    FULL=$(curl -sk --max-time 3 "http://127.0.0.1/server-status" 2>/dev/null)
+    # Extract the requests table — grab lines with GET/POST/HEAD
+    echo "$FULL" | grep -oE '(GET|POST|HEAD|PUT|DELETE) [^ ]+ HTTP' | \
+        sort | uniq -c | sort -rn | head -15 | \
+        while read -r cnt req; do printf "    %-6s %s\n" "$cnt" "$req"; done
+else
+    warn "server-status not reachable — enable in WHM → Apache Config → Server Status"
+fi
 
-    _sbuf "=== TOP CPU PROCESSES ==="
-    _sbuf "$(printf '%-6s %-12s %-6s %-6s %-s' PID USER %CPU %MEM COMMAND)"
-
-    local line_count=0
-    while IFS= read -r line; do
-        local pid user cpu mem cmd
-        pid=$(echo "$line"  | awk '{print $1}')
-        user=$(echo "$line" | awk '{print $2}')
-        cpu=$(echo "$line"  | awk '{print $3}')
-        mem=$(echo "$line"  | awk '{print $4}')
-        cmd=$(echo "$line"  | awk '{print $11}')
-
-        # Classify the process
-        local flag=""
-        local color="$C_RESET"
-
-        # Check if CPU exceeds threshold
-        local cpu_int=${cpu%.*}
-        if [ "${cpu_int:-0}" -ge "$CPU_PROC_THRESHOLD" ]; then
-            flag=" ◄ HIGH"
-            color="$C_YELLOW"
-        fi
-
-        # Flag suspicious patterns
-        case "$cmd" in
-            *perl*|*python*|*php*|*ruby*)
-                # Check for known attack scripts
-                local cmdline
-                cmdline=$(cat /proc/"$pid"/cmdline 2>/dev/null | tr '\0' ' ')
-                case "$cmdline" in
-                    *spam*|*flood*|*brute*|*masscan*|*nmap*|*sqlmap*)
-                        flag=" ◄ SUSPICIOUS"
-                        color="$C_RED"
-                        ;;
-                esac
-                ;;
-            *crypto*|*minerd*|*xmrig*|*cpuminer*)
-                flag=" ◄ POSSIBLE CRYPTOMINER"
-                color="$C_RED"
-                ;;
-        esac
-
-        # Map user to cPanel account
-        local cpanel_tag=""
-        if [ -d "/home/${user}/public_html" ] || \
-           [ -f "/var/cpanel/users/${user}" ]; then
-            cpanel_tag=" [cPanel]"
-        fi
-
-        printf "${color}%-6s %-10s %-6s %-6s %-30s${C_RESET}%s%s\n" \
-            "$pid" "${user}${cpanel_tag}" "$cpu" "$mem" "$cmd" "$flag" ""
-
-        _sbuf "$(printf '%-6s %-14s %-6s %-6s %-30s%s' \
-            "$pid" "${user}" "$cpu" "$mem" "$cmd" "$flag")"
-
-        line_count=$((line_count + 1))
-        [ "$line_count" -ge 20 ] && break
-
-    done < <(ps aux --sort=-%cpu | tail -n +2 | \
-             { [ -n "$TARGET_USER" ] && grep "^${TARGET_USER}" || cat; })
-}
-
-# =============================================================================
-# SECTION 2 — Per cPanel account CPU usage rollup
-# =============================================================================
-section_account_rollup() {
-    section "2. CPU USAGE BY cPANEL ACCOUNT"
-    echo ""
-    printf "${C_BOLD}%-20s %-10s %-10s %-s${C_RESET}\n" \
-        "ACCOUNT" "TOTAL%CPU" "PROCESSES" "TOP COMMAND"
-    echo "──────────────────────────────────────────────────────────────"
-
-    _sbuf ""
-    _sbuf "=== CPU BY ACCOUNT ==="
-    _sbuf "$(printf '%-20s %-10s %-10s %-s' ACCOUNT TOTAL%CPU PROCESSES TOP_CMD)"
-
-    declare -A acc_cpu acc_pcount acc_topcmd
-
-    while IFS= read -r line; do
-        local user cpu cmd
-        user=$(echo "$line" | awk '{print $1}')
-        cpu=$(echo "$line"  | awk '{print $3}')
-        cmd=$(echo "$line"  | awk '{print $11}')
-
-        # Only count cPanel users
-        [ -f "/var/cpanel/users/${user}" ] || continue
-
-        # Accumulate
-        acc_cpu[$user]=$(echo "${acc_cpu[$user]:-0} + ${cpu:-0}" | bc 2>/dev/null)
-        acc_pcount[$user]=$(( ${acc_pcount[$user]:-0} + 1 ))
-        [ -z "${acc_topcmd[$user]}" ] && acc_topcmd[$user]="$cmd"
-
-    done < <(ps aux --sort=-%cpu | tail -n +2)
-
-    # Sort by CPU descending and print
-    for user in $(for k in "${!acc_cpu[@]}"; do
-                      echo "${acc_cpu[$k]} $k"
-                  done | sort -rn | awk '{print $2}' | head -"$TOP_ACCOUNTS_COUNT"); do
-
-        local total_cpu="${acc_cpu[$user]}"
-        local pcount="${acc_pcount[$user]}"
-        local topcmd="${acc_topcmd[$user]}"
-        local color="$C_RESET"
-
-        # Color-code by severity
-        local cpu_int=${total_cpu%.*}
-        [ "${cpu_int:-0}" -ge 50 ] && color="$C_RED"
-        [ "${cpu_int:-0}" -ge 20 ] && [ "${cpu_int:-0}" -lt 50 ] && color="$C_YELLOW"
-
-        printf "${color}%-20s %-10s %-10s %-s${C_RESET}\n" \
-            "$user" "${total_cpu}%" "$pcount" "$topcmd"
-
-        _sbuf "$(printf '%-20s %-10s %-10s %-s' \
-            "$user" "${total_cpu}%" "$pcount" "$topcmd")"
+# Per-domain domlogs — top hit accounts
+echo ""
+info "Top accounts by recent web hits (cPanel domlogs):"
+if [ -d /usr/local/apache/domlogs ]; then
+    declare -A DOM_HITS
+    for domlog in /usr/local/apache/domlogs/*/; do
+        ACCT=$(basename "$domlog")
+        [ -f "/var/cpanel/users/${ACCT}" ] || continue
+        [ -n "$TARGET_USER" ] && [ "$ACCT" != "$TARGET_USER" ] && continue
+        HITS=$(find "$domlog" -name "*.log" -o -name "*access*" 2>/dev/null | \
+               xargs -I{} tail -500 {} 2>/dev/null | wc -l)
+        [ "${HITS:-0}" -gt 0 ] && DOM_HITS[$ACCT]=$HITS
     done
-}
+    for ACCT in $(for k in "${!DOM_HITS[@]}"; do
+                      echo "${DOM_HITS[$k]} $k"; done | \
+                  sort -rn | awk '{print $2}' | head -15); do
+        printf "    %-20s %s recent log lines\n" "$ACCT" "${DOM_HITS[$ACCT]}"
+    done
+else
+    warn "cPanel domlogs not found at /usr/local/apache/domlogs"
+fi
 
 # =============================================================================
-# SECTION 3 — Apache/LiteSpeed worker analysis
+# SECTION 5 — Abuse indicators
 # =============================================================================
-section_apache_workers() {
-    section "3. APACHE / LITESPEED WORKER ANALYSIS"
+hdr "5. ABUSE & ATTACK INDICATORS"
+echo ""
+
+# wp-login brute force
+info "wp-login.php brute force (active processes):"
+WP_PROCS=$(ps aux | grep -i "wp-login" | grep -v grep)
+if [ -n "$WP_PROCS" ]; then
+    crit "ACTIVE wp-login.php processes — brute force likely in progress:"
+    echo "$WP_PROCS" | while IFS= read -r l; do
+        USR=$(echo "$l" | awk '{print $1}')
+        PID=$(echo "$l" | awk '{print $2}')
+        CPU=$(echo "$l" | awk '{print $3}')
+        echo -e "    ${R}PID $PID${N} | User: ${Y}$USR${N} | CPU: ${R}${CPU}%${N}"
+    done
     echo ""
-
-    _sbuf ""
-    _sbuf "=== WEB SERVER WORKERS ==="
-
-    # Detect web server
-    local ws_bin=""
-    if pgrep -x httpd    &>/dev/null; then ws_bin="httpd"
-    elif pgrep -x apache2 &>/dev/null; then ws_bin="apache2"
-    elif pgrep -x lshttpd &>/dev/null; then ws_bin="lshttpd"
-    fi
-
-    if [ -z "$ws_bin" ]; then
-        log_warn "No recognized web server process found running."
-        _sbuf "No web server process detected."
-        return
-    fi
-
-    local ws_count
-    ws_count=$(pgrep -c "$ws_bin" 2>/dev/null || echo "0")
-    local ws_cpu
-    ws_cpu=$(ps aux | grep "$ws_bin" | grep -v grep | \
-             awk '{sum+=$3} END {printf "%.1f", sum}')
-
-    log_info "Web server  : $ws_bin"
-    log_info "Workers     : $ws_count processes"
-    log_info "Total %CPU  : ${ws_cpu}%"
-
-    _sbuf "Web server : $ws_bin | Workers: $ws_count | CPU: ${ws_cpu}%"
-
-    # Show server-status if available (Apache mod_status)
-    if [ -f /usr/local/apache/bin/apachectl ]; then
-        local server_status
-        server_status=$(curl -sk "http://localhost/server-status?auto" 2>/dev/null | head -20)
-        if [ -n "$server_status" ]; then
-            echo ""
-            log_info "Apache mod_status:"
-            echo "$server_status" | grep -E "BusyWorkers|IdleWorkers|ReqPerSec|BytesPerSec" | \
-                while read -r l; do log_dim "  $l"; done
-        fi
-    fi
-
-    # Top Apache-spawned users (from /proc)
-    echo ""
-    log_info "Top domains/users generating Apache workers:"
-    ps aux | grep "$ws_bin" | grep -v grep | \
+    info "Attacker IPs from domlogs (wp-login hits):"
+    grep -rh "wp-login" /usr/local/apache/domlogs/ 2>/dev/null | \
         awk '{print $1}' | sort | uniq -c | sort -rn | head -10 | \
-        while read -r count user; do
-            printf "  %-5s requests from user: %s\n" "$count" "$user"
-        done
-}
+        while read -r cnt ip; do printf "    %-6s %s\n" "$cnt" "$ip"; done
+else
+    ok "No wp-login.php brute force processes active."
+fi
+
+# xmlrpc abuse
+echo ""
+info "xmlrpc.php abuse (active processes):"
+XMLRPC=$(ps aux | grep -i "xmlrpc" | grep -v grep)
+if [ -n "$XMLRPC" ]; then
+    crit "xmlrpc.php processes running:"
+    echo "$XMLRPC" | awk '{printf "    PID: %-8s User: %-15s CPU: %s%%\n", $2, $1, $3}'
+else
+    ok "No xmlrpc.php abuse detected."
+fi
+
+# Processes from /tmp
+echo ""
+info "Processes running from /tmp (malware indicator):"
+SHADY=$(ls -la /proc/[0-9]*/exe 2>/dev/null | grep -E '-> /tmp/|-> /dev/shm/|-> /var/tmp/')
+if [ -n "$SHADY" ]; then
+    crit "SUSPICIOUS — processes executing from temp dirs:"
+    echo "$SHADY" | while IFS= read -r l; do echo -e "    ${R}$l${N}"; done
+else
+    ok "No processes running from /tmp or /dev/shm."
+fi
+
+# Connection flood
+echo ""
+info "Top source IPs by active connections:"
+ss -tn state established 2>/dev/null | awk 'NR>1{print $5}' | \
+    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+    sort | uniq -c | sort -rn | head -8 | \
+    while read -r cnt ip; do
+        CLR=$N; FLAG=""
+        [ "$cnt" -ge 100 ] && CLR=$R && FLAG=" ◄ POSSIBLE FLOOD"
+        [ "$cnt" -ge 30  ] && [ "$cnt" -lt 100 ] && CLR=$Y && FLAG=" ◄ ELEVATED"
+        printf "${CLR}    %-6s %s%s${N}\n" "$cnt" "$ip" "$FLAG"
+    done
 
 # =============================================================================
-# SECTION 4 — PHP process analysis (PHP-FPM pools + CGI)
+# SECTION 6 — Suggestions
 # =============================================================================
-section_php_workers() {
-    section "4. PHP PROCESS ANALYSIS"
+hdr "6. RECOMMENDATIONS"
+echo ""
+
+LOAD_I=${LOAD1%.*}
+if [ "${LOAD_I:-0}" -ge $(( CPU_CORES * 3 )) ]; then
+    crit "Load ${LOAD1} is 3x core count — server severely overloaded"
+    echo -e "    ${Y}→${N} Check Section 2 above for the top account and suspend/throttle immediately"
+    echo -e "    ${Y}→${N} Check Section 5 for active attack patterns"
+elif [ "${LOAD_I:-0}" -ge "$CPU_CORES" ]; then
+    warn "Load ${LOAD1} exceeds core count (${CPU_CORES})"
+    echo -e "    ${Y}→${N} Monitor accounts in Section 2. Set LVE limits if persistent."
+else
+    ok "Load is within normal range."
+fi
+
+if [ -n "$WP_PROCS" ]; then
     echo ""
+    crit "wp-login brute force is actively consuming CPU"
+    echo -e "    ${Y}→${N} Block attacker IPs:  csf -d <IP>"
+    echo -e "    ${Y}→${N} Block pattern via Imunify WAF or CSF port flood settings"
+    echo -e "    ${Y}→${N} Notify account owner — recommend Cloudflare or login limiter plugin"
+fi
 
-    _sbuf ""
-    _sbuf "=== PHP PROCESSES ==="
-
-    # Count PHP workers by handler
-    local php_fpm_count  php_cgi_count php_cli_count
-    php_fpm_count=$(pgrep -c "php-fpm"  2>/dev/null || echo 0)
-    php_cgi_count=$(pgrep -c "php-cgi"  2>/dev/null || echo 0)
-    php_cli_count=$(ps aux | grep "php " | grep -v grep | wc -l)
-
-    log_info "PHP-FPM workers : $php_fpm_count"
-    log_info "PHP-CGI workers : $php_cgi_count"
-    log_info "PHP CLI procs   : $php_cli_count"
-
-    _sbuf "PHP-FPM: $php_fpm_count | PHP-CGI: $php_cgi_count | PHP-CLI: $php_cli_count"
-
-    # Flag long-running PHP CLI (often abuse — spammers, crypto, scrapers)
+MYSQL_CPU=$(ps aux | grep -E 'mysqld|mariadbd' | grep -v grep | \
+            awk '{sum+=$3} END {printf "%.0f", sum+0}')
+if [ "${MYSQL_CPU:-0}" -ge 40 ]; then
     echo ""
-    log_info "Long-running PHP CLI processes (>60s — investigate these):"
-    local found_long=0
-    while IFS= read -r line; do
-        local pid elapsed cmd user
-        pid=$(echo "$line"     | awk '{print $1}')
-        user=$(echo "$line"    | awk '{print $2}')
-        elapsed=$(echo "$line" | awk '{print $10}')
-        cmd=$(cat /proc/"$pid"/cmdline 2>/dev/null | tr '\0' ' ' | cut -c1-80)
+    warn "MySQL at ${MYSQL_CPU}% CPU"
+    echo -e "    ${Y}→${N} Run: mysql -e 'SHOW FULL PROCESSLIST\\G' | grep -A5 'Time: [0-9][0-9]'"
+    echo -e "    ${Y}→${N} Check: tail -50 /var/lib/mysql/*-slow.log"
+fi
 
-        # Convert elapsed (MM:SS or HH:MM:SS) — flag if > 1 min
-        local mins
-        mins=$(echo "$elapsed" | awk -F: '{if(NF==3) print $1*60+$2; else print $1}')
-        if [ "${mins:-0}" -ge 1 ]; then
-            log_warn "  PID $pid | User: $user | Elapsed: $elapsed"
-            log_dim  "  CMD: $cmd"
-            _sbuf "  LONG PHP: PID=$pid user=$user elapsed=$elapsed cmd=$cmd"
-            found_long=$((found_long + 1))
-        fi
-    done < <(ps aux | grep "php " | grep -v grep | grep -v "php-fpm" | grep -v "php-cgi")
-
-    [ "$found_long" -eq 0 ] && log_ok "No long-running PHP CLI processes found."
-}
-
-# =============================================================================
-# SECTION 5 — MySQL query analysis
-# =============================================================================
-section_mysql() {
-    section "5. MYSQL ACTIVE QUERY ANALYSIS"
-    echo ""
-
-    _sbuf ""
-    _sbuf "=== MYSQL ==="
-
-    # Check if MySQL is running
-    if ! pgrep -x mysqld &>/dev/null && ! pgrep -x mariadbd &>/dev/null; then
-        log_warn "MySQL/MariaDB not running."
-        return
-    fi
-
-    # Try to get processlist (reads from /root/.my.cnf if present)
-    local process_list
-    process_list=$(mysql -e "SHOW FULL PROCESSLIST;" 2>/dev/null)
-
-    if [ -z "$process_list" ]; then
-        log_warn "Could not connect to MySQL. Ensure /root/.my.cnf has credentials."
-        _sbuf "MySQL: could not connect"
-        return
-    fi
-
-    local total_queries sleep_queries slow_queries
-    total_queries=$(echo "$process_list" | tail -n +2 | wc -l)
-    sleep_queries=$(echo "$process_list" | grep -c "Sleep")
-    slow_queries=$(echo "$process_list"  | awk '$7 > 10 {print}' | wc -l)
-
-    log_info "Total connections  : $total_queries"
-    log_info "Sleeping           : $sleep_queries"
-    log_warn "Queries > 10s      : $slow_queries"
-
-    _sbuf "MySQL: total=$total_queries sleeping=$sleep_queries slow(>10s)=$slow_queries"
-
-    if [ "$slow_queries" -gt 0 ]; then
-        echo ""
-        log_warn "SLOW / ACTIVE QUERIES:"
-        echo "$process_list" | awk 'NR==1 || $7 > 5' | \
-            awk '{printf "  %-6s %-15s %-8s %-s\n", $1, $3, $7, $8}' | head -15
-    fi
-
-    # Top databases by connection
-    echo ""
-    log_info "Top databases by connection count:"
-    echo "$process_list" | tail -n +2 | awk '{print $4}' | \
-        sort | uniq -c | sort -rn | head -10 | \
-        awk '{printf "  %-5s connections to db: %s\n", $1, $2}'
-}
-
-# =============================================================================
-# SECTION 6 — Attack pattern detection
-# =============================================================================
-section_attack_detection() {
-    section "6. POTENTIAL ATTACK / ABUSE DETECTION"
-    echo ""
-
-    _sbuf ""
-    _sbuf "=== ATTACK DETECTION ==="
-
-    local suspicious_found=0
-
-    # --- High connection count from single IP (SYN flood / HTTP flood)
-    log_info "Checking for connection floods..."
-    local top_ip ip_count
-    top_ip=$(ss -tn state established 2>/dev/null | \
-             awk 'NR>1 {print $5}' | cut -d: -f1 | \
-             sort | uniq -c | sort -rn | head -1)
-    ip_count=$(echo "$top_ip" | awk '{print $1}')
-    top_ip_addr=$(echo "$top_ip" | awk '{print $2}')
-
-    if [ "${ip_count:-0}" -ge 50 ]; then
-        log_crit "Possible flood: IP ${top_ip_addr} has ${ip_count} connections"
-        _sbuf "FLOOD: $top_ip_addr = $ip_count connections"
-        suspicious_found=$((suspicious_found + 1))
-    else
-        log_ok "No connection flood detected. Top IP: ${top_ip_addr} (${ip_count} conns)"
-    fi
-
-    # --- Processes running from /tmp or /dev/shm (malware indicator)
-    echo ""
-    log_info "Checking for processes running from /tmp or /dev/shm..."
-    local shady_procs
-    shady_procs=$(ls -la /proc/[0-9]*/exe 2>/dev/null | grep -E '/tmp|/dev/shm|/var/tmp')
-    if [ -n "$shady_procs" ]; then
-        log_crit "SUSPICIOUS: Processes executing from temp directories:"
-        echo "$shady_procs" | while read -r l; do log_warn "  $l"; done
-        _sbuf "MALWARE INDICATOR: processes from /tmp or /dev/shm"
-        suspicious_found=$((suspicious_found + 1))
-    else
-        log_ok "No processes running from /tmp or /dev/shm."
-    fi
-
-    # --- Check for known crypto miner process names
-    echo ""
-    log_info "Checking for cryptominer indicators..."
-    local miner_hits
-    miner_hits=$(ps aux | grep -iE 'xmrig|minerd|cpuminer|cryptonight|stratum' | grep -v grep)
-    if [ -n "$miner_hits" ]; then
-        log_crit "CRYPTOMINER DETECTED:"
-        echo "$miner_hits" | while read -r l; do log_warn "  $l"; done
-        _sbuf "CRYPTOMINER: $miner_hits"
-        suspicious_found=$((suspicious_found + 1))
-    else
-        log_ok "No cryptominer processes detected."
-    fi
-
-    # --- Summary
-    echo ""
-    if [ "$suspicious_found" -gt 0 ]; then
-        log_crit "Total suspicious indicators found: $suspicious_found"
-        _sbuf "TOTAL SUSPICIOUS: $suspicious_found"
-    else
-        log_ok "No obvious attack/abuse patterns detected."
-        _sbuf "No attack patterns detected."
-    fi
-}
-
-# =============================================================================
-# MAIN
-# =============================================================================
-main() {
-    header "CPU INVESTIGATION REPORT"
-    write_log "cpu_investigate" "Investigation started"
-
-    [ -n "$TARGET_USER" ] && log_info "Filtering for cPanel user: ${TARGET_USER}"
-
-    section_top_processes
-    section_account_rollup
-    section_apache_workers
-    section_php_workers
-    section_mysql
-    section_attack_detection
-
-    echo ""
-    section "INVESTIGATION COMPLETE"
-    log_info "Full log saved to: ${LOG_DIR}/cpu_investigate.log"
-
-    write_log "cpu_investigate" "Investigation complete"
-
-    if [ "$POST_SLACK" = true ]; then
-        slack_post "CPU Investigation" "$SLACK_BUFFER"
-        log_info "Findings posted to Slack."
-    else
-        echo ""
-        log_dim "Tip: run with --slack to post findings to Slack automatically"
-    fi
-}
-
-main "$@"
+echo ""
+sep
+echo -e "${B}  QUICK REFERENCE ONE-LINERS${N}"
+sep
+echo ""
+echo -e "  ${D}# Watch live CPU every 2 seconds:${N}"
+echo    "  watch -n2 'ps aux --sort=-%cpu | head -20'"
+echo ""
+echo -e "  ${D}# All lsphp grouped by account:${N}"
+echo    "  ps aux | grep lsphp | grep -v grep | awk '{print \$1}' | sort | uniq -c | sort -rn"
+echo ""
+echo -e "  ${D}# wp-login attacker IPs from domlogs:${N}"
+echo    "  grep -rh wp-login /usr/local/apache/domlogs/ 2>/dev/null | awk '{print \$1}' | sort | uniq -c | sort -rn | head -20"
+echo ""
+echo -e "  ${D}# Block an IP via CSF:${N}"
+echo    "  csf -d <IP>  \"wp-login flood $(date +%Y-%m-%d)\""
+echo ""
+echo -e "  ${D}# Throttle account via LVE (50% of 1 core):${N}"
+echo    "  lvectl set <username> --speed=50% --ncpu=1"
+echo ""
+echo -e "  ${D}# Check LVE limits for account:${N}"
+echo    "  lvectl get <username>"
+echo ""
+echo -e "  ${D}# Suspend via WHM API:${N}"
+echo    "  whmapi1 suspendacct user=<username> reason='CPU abuse'"
+echo ""
+echo -e "  ${D}# MySQL slow query check:${N}"
+echo    "  mysql -e 'SHOW FULL PROCESSLIST\G' | grep -B2 'Time: [0-9][0-9]'"
+echo ""
+echo -e "${G}${B}  Done — $(date '+%H:%M:%S')${N}"
+echo ""

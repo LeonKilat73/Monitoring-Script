@@ -1,383 +1,664 @@
 #!/bin/bash
 # =============================================================================
-# /opt/hostmon/firewall_status.sh
-# =============================================================================
-# PURPOSE: Investigate CSF and Imunify360 health, block patterns,
-#          rule effectiveness, and whether the firewall itself is overloaded.
+# firewall_status.sh — Self-contained Firewall Investigation
+# Drop anywhere, run as root. No external dependencies.
+#
+# PURPOSE: Investigate CSF and Imunify360 health when Zabbix fires a
+#          firewall alert. Answers:
+#   - Is CSF/LFD actually running and healthy?
+#   - What attack patterns has LFD detected recently?
+#   - Is Imunify360 running? Any malware or WAF events?
+#   - Is iptables overloaded with too many rules?
+#   - Any active connection floods happening right now?
 #
 # USAGE:
-#   bash firewall_status.sh               # Full firewall report
-#   bash firewall_status.sh --slack       # Also post to Slack
-#   bash firewall_status.sh --minutes 30  # Lookback window override
+#   bash firewall_status.sh                   # Full report (60min lookback)
+#   bash firewall_status.sh --minutes 30      # Change lookback window
+#   bash firewall_status.sh --block 1.2.3.4   # Block IP via CSF
+#   bash firewall_status.sh --unblock 1.2.3.4 # Unblock IP from CSF
+#   bash firewall_status.sh --check 1.2.3.4   # Check if IP is blocked anywhere
 # =============================================================================
 
-HOSTMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${HOSTMON_DIR}/lib/common.sh"
-require_root
-require_cmds awk grep sort
-
-POST_SLACK=false
-LOOKBACK="${FIREWALL_LOOKBACK_MINUTES}"
+LOOKBACK=60
+BLOCK_IP=""
+UNBLOCK_IP=""
+CHECK_IP=""
+ATTACK_THRESHOLD=10
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
-        --slack)   POST_SLACK=true ;;
-        --minutes) LOOKBACK="$2"; shift ;;
+        --minutes) LOOKBACK="$2";   shift ;;
+        --block)   BLOCK_IP="$2";   shift ;;
+        --unblock) UNBLOCK_IP="$2"; shift ;;
+        --check)   CHECK_IP="$2";   shift ;;
     esac
     shift
 done
 
-SLACK_BUFFER=""
-_sbuf() { SLACK_BUFFER+="$*"$'\n'; }
+# --- Colors
+R='\033[0;31m'; Y='\033[1;33m'; G='\033[0;32m'
+C='\033[0;36m'; B='\033[1m';    D='\033[2m'; N='\033[0m'
+
+# --- Root check
+if [ "$EUID" -ne 0 ]; then
+    echo "Run as root." >&2
+    exit 1
+fi
+
+sep()  { echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"; }
+hdr()  { echo ""; sep; echo -e "${B}  $*${N}"; sep; }
+info() { echo -e "  ${C}•${N} $*"; }
+warn() { echo -e "  ${Y}▲${N} $*"; }
+crit() { echo -e "  ${R}✖${N} $*"; }
+ok()   { echo -e "  ${G}✔${N} $*"; }
+
+_confirm() {
+    echo ""
+    echo -e "  ${Y}⚠  $1${N}"
+    echo -ne "  Type YES to confirm: "
+    read -r answer
+    [ "$answer" = "YES" ]
+}
+
+HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+CSF_LOG="/var/log/lfd.log"
+IMUNIFY_LOG="/var/log/imunify360/console.log"
+
+echo ""
+echo -e "${B}╔══════════════════════════════════════════════════════════════╗${N}"
+echo -e "${B}  FIREWALL STATUS — ${HOSTNAME}${N}"
+echo -e "${D}  $(date '+%Y-%m-%d %H:%M:%S')  |  Lookback: ${LOOKBACK} minutes${N}"
+echo -e "${B}╚══════════════════════════════════════════════════════════════╝${N}"
 
 # =============================================================================
-# SECTION 1 — CSF Status & Health
+# QUICK ACTIONS — Block / Unblock / Check (run and exit)
 # =============================================================================
-section_csf_status() {
-    section "1. CSF (ConfigServer Security & Firewall) STATUS"
+if [ -n "$BLOCK_IP" ]; then
+    hdr "QUICK ACTION — BLOCK IP: ${BLOCK_IP}"
+    echo ""
+    if ! command -v csf &>/dev/null; then
+        crit "CSF not found — cannot block."
+        exit 1
+    fi
+    if _confirm "Permanently block ${BLOCK_IP} via CSF?"; then
+        csf -d "$BLOCK_IP" "Blocked by firewall_status.sh on $(date '+%Y-%m-%d %H:%M')"
+        ok "IP ${BLOCK_IP} added to CSF permanent deny list."
+        info "To unblock later: bash firewall_status.sh --unblock ${BLOCK_IP}"
+    else
+        info "Cancelled."
+    fi
+    exit 0
+fi
+
+if [ -n "$UNBLOCK_IP" ]; then
+    hdr "QUICK ACTION — UNBLOCK IP: ${UNBLOCK_IP}"
+    echo ""
+    if ! command -v csf &>/dev/null; then
+        crit "CSF not found."
+        exit 1
+    fi
+    if _confirm "Remove ${UNBLOCK_IP} from all CSF block lists?"; then
+        csf -dr "$UNBLOCK_IP" 2>/dev/null && ok "Removed from permanent deny list." || \
+            info "Was not in permanent deny list."
+        csf -tr "$UNBLOCK_IP" 2>/dev/null && ok "Removed from temp block list." || \
+            info "Was not in temp block list."
+        # Also remove from Imunify if available
+        if command -v imunify360-agent &>/dev/null; then
+            imunify360-agent blacklist ip delete --ip "$UNBLOCK_IP" 2>/dev/null && \
+                ok "Removed from Imunify360 blacklist." || true
+        fi
+    else
+        info "Cancelled."
+    fi
+    exit 0
+fi
+
+if [ -n "$CHECK_IP" ]; then
+    hdr "IP STATUS CHECK — ${CHECK_IP}"
     echo ""
 
-    _sbuf "=== CSF STATUS ==="
-
-    if ! command -v csf &>/dev/null; then
-        log_warn "CSF not installed or not in PATH."
-        _sbuf "CSF: not found"
-        return
-    fi
-
-    # Is CSF running?
-    local csf_status
-    if csf --status 2>/dev/null | grep -q "RUNNING"; then
-        log_ok "CSF is RUNNING"
-        _sbuf "CSF: RUNNING"
+    # CSF permanent deny
+    if grep -qE "^${CHECK_IP}(\s|$|#)" /etc/csf/csf.deny 2>/dev/null; then
+        crit "${CHECK_IP} — IN CSF permanent deny list (csf.deny)"
+        grep -E "^${CHECK_IP}" /etc/csf/csf.deny | \
+            while IFS= read -r l; do echo -e "    ${D}$l${N}"; done
     else
-        log_crit "CSF is STOPPED or in TEST MODE"
-        _sbuf "CSF: STOPPED — CRITICAL"
+        ok "${CHECK_IP} — NOT in CSF permanent deny list"
     fi
 
-    # Is CSF in testing mode? (iptables flushed every 5 min — very dangerous)
+    # CSF whitelist
+    if grep -qE "^${CHECK_IP}(\s|$|#)" /etc/csf/csf.allow 2>/dev/null; then
+        ok "${CHECK_IP} — IN CSF whitelist (csf.allow)"
+    fi
+
+    # CSF temp blocks
+    echo ""
+    if command -v csf &>/dev/null; then
+        TEMP_HIT=$(csf -t 2>/dev/null | grep "${CHECK_IP}")
+        if [ -n "$TEMP_HIT" ]; then
+            warn "${CHECK_IP} — IN CSF temporary block list:"
+            echo "$TEMP_HIT" | while IFS= read -r l; do echo "    $l"; done
+        else
+            ok "${CHECK_IP} — NOT in CSF temp block list"
+        fi
+    fi
+
+    # Imunify360
+    echo ""
+    if command -v imunify360-agent &>/dev/null; then
+        I360_HIT=$(imunify360-agent blacklist ip list 2>/dev/null | grep "${CHECK_IP}")
+        if [ -n "$I360_HIT" ]; then
+            warn "${CHECK_IP} — IN Imunify360 blacklist"
+        else
+            ok "${CHECK_IP} — NOT in Imunify360 blacklist"
+        fi
+    fi
+
+    # Recent LFD activity
+    echo ""
+    info "Recent LFD log entries for ${CHECK_IP}:"
+    LFD_HITS=$(grep "${CHECK_IP}" "$CSF_LOG" 2>/dev/null | tail -8)
+    if [ -n "$LFD_HITS" ]; then
+        warn "LFD history found:"
+        echo "$LFD_HITS" | while IFS= read -r l; do echo -e "    ${D}$l${N}"; done
+    else
+        ok "No LFD log entries found for this IP."
+    fi
+
+    # Active connections
+    echo ""
+    info "Active connections from ${CHECK_IP}:"
+    ACTIVE=$(ss -tn state established 2>/dev/null | grep "${CHECK_IP}")
+    if [ -n "$ACTIVE" ]; then
+        warn "Active connections exist:"
+        echo "$ACTIVE" | while IFS= read -r l; do echo "    $l"; done
+    else
+        ok "No active connections from this IP."
+    fi
+
+    echo ""
+    sep
+    echo -e "${G}${B}  Check complete — $(date '+%H:%M:%S')${N}"
+    sep
+    echo ""
+    exit 0
+fi
+
+# =============================================================================
+# SECTION 1 — CSF Health & Status
+# =============================================================================
+hdr "1. CSF (ConfigServer Security & Firewall) STATUS"
+echo ""
+
+if ! command -v csf &>/dev/null; then
+    warn "CSF not installed or not found in PATH."
+    info "Install guide: https://configserver.com/cp/csf.html"
+else
+    # Running state
+    if csf --status 2>/dev/null | grep -qE "RUNNING|Chain CSF"; then
+        ok "CSF firewall: RUNNING"
+    else
+        crit "CSF firewall: STOPPED or not loaded"
+        warn "  Fix: csf -r"
+    fi
+
+    # Testing mode (flushes rules every 5 min — extremely dangerous in production)
     if grep -q "^TESTING = \"1\"" /etc/csf/csf.conf 2>/dev/null; then
-        log_crit "CSF is in TESTING MODE — firewall rules flush every 5 minutes!"
-        _sbuf "CSF WARNING: TESTING MODE ENABLED"
+        crit "TESTING MODE is ON — rules flush every 5 minutes — server is exposed!"
+        warn "  Fix: set TESTING = \"0\" in /etc/csf/csf.conf  then: csf -r"
     else
-        log_ok "CSF testing mode: OFF (good)"
+        ok "Testing mode: OFF (good)"
     fi
 
-    # LFD (Login Failure Daemon) status
+    # LFD daemon
     echo ""
     if pgrep -x lfd &>/dev/null; then
-        log_ok "LFD daemon: RUNNING"
-        _sbuf "LFD: RUNNING"
+        LFD_PID=$(pgrep -x lfd | head -1)
+        LFD_UPTIME=$(ps -p "$LFD_PID" -o etime= 2>/dev/null | tr -d ' ')
+        ok "LFD daemon: RUNNING  (PID: ${LFD_PID}  uptime: ${LFD_UPTIME})"
     else
-        log_crit "LFD daemon: NOT RUNNING — brute force detection is inactive"
-        _sbuf "LFD: NOT RUNNING — CRITICAL"
+        crit "LFD daemon: NOT RUNNING — brute force detection is inactive!"
+        warn "  Fix: service lfd start"
     fi
 
-    # CSF block counts
+    # Block / Allow counts
     echo ""
-    local csf_deny_count csf_temp_count
-    csf_deny_count=$(wc -l < /etc/csf/csf.deny 2>/dev/null || echo 0)
-    csf_temp_count=$(csf -t 2>/dev/null | grep -c "IP:" || echo 0)
+    DENY_COUNT=$(grep -cE "^[^#[:space:]]" /etc/csf/csf.deny  2>/dev/null || echo 0)
+    ALLOW_COUNT=$(grep -cE "^[^#[:space:]]" /etc/csf/csf.allow 2>/dev/null || echo 0)
+    TEMP_COUNT=$(csf -t 2>/dev/null | grep -c "IP:" || echo 0)
 
-    log_info "Permanent blocks (csf.deny)  : ${csf_deny_count}"
-    log_info "Temporary blocks (csf -t)    : ${csf_temp_count}"
-    _sbuf "CSF permanent blocks: $csf_deny_count | temp blocks: $csf_temp_count"
+    printf "  %-38s ${R}%s${N}\n"  "Permanent blocked IPs  (csf.deny):"  "$DENY_COUNT"
+    printf "  %-38s ${G}%s${N}\n"  "Whitelisted IPs        (csf.allow):" "$ALLOW_COUNT"
+    printf "  %-38s ${Y}%s${N}\n"  "Temporary blocks       (csf -t):"    "$TEMP_COUNT"
 
-    # Warn if deny list is very large (performance concern)
-    if [ "$csf_deny_count" -gt 5000 ]; then
-        log_warn "csf.deny has ${csf_deny_count} entries — consider using CIDR blocks or ipset for performance"
-        _sbuf "CSF WARN: Large deny list may impact iptables performance"
+    echo ""
+    if [ "${DENY_COUNT:-0}" -gt 5000 ]; then
+        warn "csf.deny has ${DENY_COUNT} entries — this many rules can degrade iptables performance"
+        info "  Consider using ipset for bulk IP blocks to reduce overhead"
+    else
+        ok "Deny list size is manageable (${DENY_COUNT} entries)."
     fi
 
-    # Recent CSF config changes
+    # Config last modified
     echo ""
-    log_info "Last CSF config modification:"
-    stat /etc/csf/csf.conf 2>/dev/null | grep Modify | \
-        sed 's/Modify:/  Modified:/'
-}
+    CONF_MOD=$(stat -c '%y' /etc/csf/csf.conf 2>/dev/null | cut -d. -f1)
+    info "csf.conf last modified: ${CONF_MOD:-unknown}"
+
+    # Key security settings from csf.conf
+    echo ""
+    info "Key CSF security settings:"
+    echo ""
+    printf "    ${B}%-30s %s${N}\n" "SETTING" "VALUE"
+    echo "    ──────────────────────────────────────────"
+    for KEY in TESTING SMTP_BLOCK LF_SSHD LF_FTPD LF_IMAPD LF_SMTPAUTH \
+               LF_SCRIPT_ALERT CT_LIMIT CT_INTERVAL PS_LIMIT PORTFLOOD \
+               LF_TRIGGER SYNFLOOD SYNFLOOD_RATE SYNFLOOD_BURST; do
+        VAL=$(grep "^${KEY} = " /etc/csf/csf.conf 2>/dev/null | \
+              awk -F'"' '{print $2}')
+        [ -z "$VAL" ] && VAL=$(grep "^${KEY} = " /etc/csf/csf.conf 2>/dev/null | \
+                               awk '{print $3}')
+        if [ -n "$VAL" ]; then
+            # Highlight risky values
+            CLR=$N
+            [ "$KEY" = "TESTING" ] && [ "$VAL" = "1" ] && CLR=$R
+            [ "$KEY" = "SMTP_BLOCK" ] && [ "$VAL" = "0" ] && CLR=$Y
+            [ "$KEY" = "SYNFLOOD" ] && [ "$VAL" = "0" ] && CLR=$Y
+            printf "    ${CLR}%-30s %s${N}\n" "${KEY}:" "$VAL"
+        fi
+    done
+fi
 
 # =============================================================================
-# SECTION 2 — LFD Log Analysis (brute force, port scans, bans)
+# SECTION 2 — LFD Log Analysis
 # =============================================================================
-section_lfd_analysis() {
-    section "2. LFD LOG ANALYSIS (last ${LOOKBACK} minutes)"
+hdr "2. LFD LOG ANALYSIS (last ${LOOKBACK} minutes)"
+echo ""
+
+if [ ! -f "$CSF_LOG" ]; then
+    warn "LFD log not found at: ${CSF_LOG}"
+    info "Also check: /var/log/messages  or  journalctl -u lfd"
+else
+    # Pull recent log lines (tail is faster than awk date parsing on large logs)
+    LFD_RECENT=$(tail -3000 "$CSF_LOG" 2>/dev/null)
+
+    BLOCK_COUNT=$(echo "$LFD_RECENT" | grep -cE "Blocked|DENY|blocked in|triggered" || echo 0)
+    info "Block/trigger events in recent log: ${BLOCK_COUNT}"
+
+    # Top blocked IPs
     echo ""
-
-    _sbuf ""
-    _sbuf "=== LFD LOG (last ${LOOKBACK}m) ==="
-
-    if [ ! -f "$CSF_LOG" ]; then
-        log_warn "LFD log not found at: $CSF_LOG"
-        _sbuf "LFD log not found"
-        return
-    fi
-
-    # Get log entries from the last N minutes
-    local since_time
-    since_time=$(date -d "${LOOKBACK} minutes ago" '+%b %e %H:%M' 2>/dev/null || \
-                 date -v-"${LOOKBACK}"M '+%b %e %H:%M' 2>/dev/null)
-
-    local lfd_recent
-    lfd_recent=$(awk -v since="$since_time" '$0 >= since' "$CSF_LOG" 2>/dev/null | \
-                 tail -500)
-
-    # --- Block events
-    local block_count
-    block_count=$(echo "$lfd_recent" | grep -c "Blocked\|DENY\|blocked" || echo 0)
-    log_info "Block events in last ${LOOKBACK}m : ${block_count}"
-    _sbuf "Blocks in last ${LOOKBACK}m: $block_count"
-
-    # --- Top blocked IPs
+    info "Top IPs appearing in LFD log:"
     echo ""
-    log_info "Top blocked IPs:"
-    echo "$lfd_recent" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
-        sort | uniq -c | sort -rn | head -10 | \
-        while read -r count ip; do
-            local flag=""
-            [ "$count" -ge "$ATTACK_PATTERN_THRESHOLD" ] && \
-                flag=" ◄ PATTERN ATTACK" && \
-                _sbuf "  ATTACK PATTERN: $ip = $count blocks"
-            printf "  %-6s %s%s\n" "$count" "$ip" \
-                "${flag:+ ${C_RED}${flag}${C_RESET}}"
+    printf "    ${B}%-6s %-18s %-s${N}\n" "COUNT" "IP ADDRESS" "FLAG"
+    echo "    ──────────────────────────────────────────────────────────"
+    echo "$LFD_RECENT" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | \
+        grep -vE '^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' | \
+        sort | uniq -c | sort -rn | head -15 | \
+        while read -r cnt ip; do
+            CLR=$N; FLAG="—"
+            if [ "$cnt" -ge "$ATTACK_THRESHOLD" ]; then
+                CLR=$R; FLAG="◄ ATTACK PATTERN"
+            elif [ "$cnt" -ge 3 ]; then
+                CLR=$Y; FLAG="◄ Repeated hits"
+            fi
+            printf "    ${CLR}%-6s %-18s %s${N}\n" "$cnt" "$ip" "$FLAG"
         done
 
-    # --- Attack types
+    # Attack service breakdown
     echo ""
-    log_info "Attack types detected:"
-    echo "$lfd_recent" | grep -oE 'SSH|FTP|SMTP|POP3|IMAP|HTTP|WHM|cPanel' | \
+    info "Services being targeted:"
+    echo ""
+    echo "$LFD_RECENT" | \
+        grep -oE 'sshd|SSH|FTP|SMTP|POP3|IMAP|HTTP|WHM|cPanel|wp-login|xmlrpc|dovecot' | \
+        tr '[:lower:]' '[:upper:]' | \
         sort | uniq -c | sort -rn | \
-        while read -r count svc; do
-            printf "  %-6s %s login attacks\n" "$count" "$svc"
-            _sbuf "  Attack type: $svc x$count"
+        while read -r cnt svc; do
+            printf "    %-6s %s\n" "$cnt" "$svc"
         done
 
-    # --- Port scans
+    # Port scans
     echo ""
-    local portscan_count
-    portscan_count=$(echo "$lfd_recent" | grep -ci "port scan\|PORTSCAN" || echo 0)
-    if [ "$portscan_count" -gt 0 ]; then
-        log_warn "Port scan detections: ${portscan_count}"
-        _sbuf "PORT SCANS: $portscan_count"
-        echo "$lfd_recent" | grep -i "port scan\|PORTSCAN" | tail -5 | \
-            while read -r l; do log_dim "  $l"; done
+    PORTSCAN=$(echo "$LFD_RECENT" | grep -ciE "port scan|PORTSCAN" || echo 0)
+    if [ "${PORTSCAN:-0}" -gt 0 ]; then
+        warn "Port scan detections: ${PORTSCAN}"
+        echo "$LFD_RECENT" | grep -iE "port scan|PORTSCAN" | tail -5 | \
+            while IFS= read -r l; do echo -e "    ${D}$l${N}"; done
     else
-        log_ok "No port scan events in window."
+        ok "No port scan events in log."
     fi
 
-    # --- Excessive resource usage blocks (cPanel/WHM accounts)
+    # Resource/process abuse (LF_RESOURCE triggers)
     echo ""
-    local resource_blocks
-    resource_blocks=$(echo "$lfd_recent" | grep -ci "resource\|excessive\|processes\|fork" || echo 0)
-    if [ "$resource_blocks" -gt 0 ]; then
-        log_warn "Resource abuse blocks: ${resource_blocks}"
-        echo "$lfd_recent" | grep -i "resource\|excessive\|processes" | tail -10 | \
-            while read -r l; do log_dim "  $l"; done
-        _sbuf "RESOURCE ABUSE BLOCKS: $resource_blocks"
+    RESOURCE_BLOCKS=$(echo "$LFD_RECENT" | \
+        grep -ciE "resource|excessive|proc limit|fork bomb|nproc" || echo 0)
+    if [ "${RESOURCE_BLOCKS:-0}" -gt 0 ]; then
+        warn "Resource abuse triggers: ${RESOURCE_BLOCKS}"
+        echo "$LFD_RECENT" | grep -iE "resource|excessive|proc limit|nproc" | tail -8 | \
+            while IFS= read -r l; do echo -e "    ${D}$l${N}"; done
+    else
+        ok "No resource abuse triggers detected."
     fi
-}
+
+    # WordPress / xmlrpc blocks
+    echo ""
+    WP_BLOCKS=$(echo "$LFD_RECENT" | grep -ciE "wp-login|xmlrpc|wordpress" || echo 0)
+    if [ "${WP_BLOCKS:-0}" -gt 0 ]; then
+        warn "WordPress/xmlrpc related entries: ${WP_BLOCKS}"
+        echo "$LFD_RECENT" | grep -iE "wp-login|xmlrpc|wordpress" | tail -5 | \
+            while IFS= read -r l; do echo -e "    ${D}$l${N}"; done
+    else
+        ok "No WordPress/xmlrpc attack entries."
+    fi
+
+    # Email-related blocks (spam, LF_SCRIPT)
+    echo ""
+    EMAIL_BLOCKS=$(echo "$LFD_RECENT" | \
+        grep -ciE "script alert|LF_SCRIPT|email limit|smtp" || echo 0)
+    if [ "${EMAIL_BLOCKS:-0}" -gt 0 ]; then
+        warn "Email/script related LFD blocks: ${EMAIL_BLOCKS}"
+        echo "$LFD_RECENT" | grep -iE "script alert|LF_SCRIPT|email limit" | tail -5 | \
+            while IFS= read -r l; do echo -e "    ${D}$l${N}"; done
+    else
+        ok "No LFD email/script abuse blocks."
+    fi
+
+    # Current temp blocks
+    echo ""
+    info "Current CSF temporary blocks:"
+    TEMP_LIST=$(csf -t 2>/dev/null | grep "IP:")
+    if [ -n "$TEMP_LIST" ]; then
+        echo "$TEMP_LIST" | tail -15 | \
+            while IFS= read -r l; do echo "    $l"; done
+    else
+        echo -e "    ${D}(no temporary blocks active)${N}"
+    fi
+fi
 
 # =============================================================================
 # SECTION 3 — Imunify360 Status & Events
 # =============================================================================
-section_imunify_status() {
-    section "3. IMUNIFY360 STATUS"
-    echo ""
+hdr "3. IMUNIFY360 STATUS & EVENTS"
+echo ""
 
-    _sbuf ""
-    _sbuf "=== IMUNIFY360 ==="
+if ! command -v imunify360-agent &>/dev/null; then
+    warn "Imunify360 not installed or not found in PATH."
+    info "Expected: /usr/bin/imunify360-agent"
+else
+    # Service running state
+    SVC_STATUS=$(systemctl is-active imunify360 2>/dev/null || \
+                 service imunify360 status 2>/dev/null | grep -oE 'running|stopped' | head -1)
 
-    if ! command -v imunify360-agent &>/dev/null; then
-        log_warn "Imunify360 not installed or not in PATH."
-        _sbuf "Imunify360: not found"
-        return
-    fi
-
-    # Service health
-    local svc_status
-    svc_status=$(systemctl is-active imunify360 2>/dev/null || \
-                 service imunify360 status 2>/dev/null | grep -oE 'running|stopped')
-    if [ "$svc_status" = "active" ] || [ "$svc_status" = "running" ]; then
-        log_ok "Imunify360 service: RUNNING"
-        _sbuf "Imunify360: RUNNING"
+    if [ "$SVC_STATUS" = "active" ] || [ "$SVC_STATUS" = "running" ]; then
+        ok "Imunify360 service: RUNNING"
     else
-        log_crit "Imunify360 service: ${svc_status:-UNKNOWN} — investigate immediately"
-        _sbuf "Imunify360: DOWN — $svc_status"
+        crit "Imunify360 service: ${SVC_STATUS:-UNKNOWN}"
+        warn "  Fix: systemctl restart imunify360"
     fi
 
-    # Imunify agent status
+    # Version
     echo ""
-    log_info "Imunify360 agent status:"
-    imunify360-agent version 2>/dev/null | while read -r l; do log_dim "  $l"; done
+    info "Installed version:"
+    imunify360-agent version 2>/dev/null | head -3 | \
+        while IFS= read -r l; do echo "    $l"; done
 
-    # Recent blocked IPs
+    # Feature status — highlight anything disabled
     echo ""
-    log_info "Recently blocked IPs (Imunify360):"
-    imunify360-agent blocked-port list 2>/dev/null | head -15 | \
-        while read -r l; do log_dim "  $l"; done
+    info "Feature status (disabled features highlighted):"
+    imunify360-agent feature-management status 2>/dev/null | \
+        grep -iE "waf|modsec|proactive|malware|realtime|reputation|av" | \
+        while IFS= read -r l; do
+            if echo "$l" | grep -qiE "disabled|off|false|0"; then
+                echo -e "    ${Y}$l${N}  ◄ DISABLED"
+            else
+                echo -e "    ${G}$l${N}"
+            fi
+        done
 
-    # Malware detections
+    # Recent incidents
     echo ""
-    log_info "Recent malware scan events:"
+    info "Recent Imunify360 incidents (last 10):"
+    imunify360-agent incidents list --limit 10 2>/dev/null | \
+        while IFS= read -r l; do echo "    $l"; done
+
+    # Malware events from log file
+    echo ""
+    info "Recent malware detections from log:"
     if [ -f "$IMUNIFY_LOG" ]; then
-        local malware_events
-        malware_events=$(tail -200 "$IMUNIFY_LOG" 2>/dev/null | \
-                         grep -i "malware\|infected\|virus\|trojan" | tail -10)
-        if [ -n "$malware_events" ]; then
-            log_warn "Malware events found:"
-            echo "$malware_events" | while read -r l; do log_dim "  $l"; done
-            _sbuf "MALWARE EVENTS:"
-            _sbuf "$malware_events"
+        MALWARE=$(tail -500 "$IMUNIFY_LOG" 2>/dev/null | \
+                  grep -iE "malware|infected|trojan|virus|webshell|dropper" | tail -10)
+        if [ -n "$MALWARE" ]; then
+            warn "Malware events found:"
+            echo "$MALWARE" | while IFS= read -r l; do echo -e "    ${Y}$l${N}"; done
         else
-            log_ok "No recent malware events in log."
+            ok "No recent malware events in Imunify360 log."
         fi
     else
-        log_warn "Imunify360 log not found at: $IMUNIFY_LOG"
+        warn "Imunify360 log not found at: ${IMUNIFY_LOG}"
+        info "Also check: /var/log/imunify360/error.log"
     fi
 
-    # Imunify WAF status
+    # Imunify blacklist sample
     echo ""
-    log_info "WAF (Web Application Firewall) status:"
-    imunify360-agent feature-management status 2>/dev/null | \
-        grep -iE "waf|modsec" | while read -r l; do log_dim "  $l"; done
+    info "Imunify360 blacklisted IPs (sample, last 10):"
+    imunify360-agent blacklist ip list 2>/dev/null | tail -10 | \
+        while IFS= read -r l; do echo "    $l"; done || \
+    imunify360-agent blocked-port list 2>/dev/null | tail -10 | \
+        while IFS= read -r l; do echo "    $l"; done
 
-    # Top attacked domains (from Imunify)
+    # Proactive defense status
     echo ""
-    log_info "Imunify360 — incidents summary:"
-    imunify360-agent incidents list --limit 10 2>/dev/null | \
-        while read -r l; do log_dim "  $l"; done
-    _sbuf "Imunify360 incidents listed above."
-}
+    info "Proactive Defense mode:"
+    imunify360-agent proactive-defense status 2>/dev/null | \
+        while IFS= read -r l; do
+            if echo "$l" | grep -qiE "disabled|off"; then
+                echo -e "    ${Y}$l${N}  ◄ Consider enabling"
+            else
+                echo -e "    ${G}$l${N}"
+            fi
+        done
+fi
 
 # =============================================================================
-# SECTION 4 — iptables rule count & performance check
+# SECTION 4 — iptables Rule Health
 # =============================================================================
-section_iptables_health() {
-    section "4. IPTABLES HEALTH & PERFORMANCE"
+hdr "4. IPTABLES RULE HEALTH"
+echo ""
+
+if ! command -v iptables &>/dev/null; then
+    warn "iptables command not found."
+else
+    TOTAL_RULES=$(iptables  -L -n 2>/dev/null | \
+        grep -cE "^ACCEPT|^DROP|^REJECT|^LOG|^RETURN|^DENY" || echo 0)
+    IP6_RULES=$(ip6tables -L -n 2>/dev/null | \
+        grep -cE "^ACCEPT|^DROP|^REJECT|^LOG|^RETURN|^DENY" || echo 0)
+
+    printf "  %-35s %s\n" "IPv4 iptables rules:"  "$TOTAL_RULES"
+    printf "  %-35s %s\n" "IPv6 ip6tables rules:"  "$IP6_RULES"
     echo ""
 
-    _sbuf ""
-    _sbuf "=== IPTABLES ==="
-
-    if ! command -v iptables &>/dev/null; then
-        log_warn "iptables not found."
-        return
+    if [ "${TOTAL_RULES:-0}" -gt 3000 ]; then
+        crit "Rule count is HIGH (${TOTAL_RULES}) — packet processing may be slow"
+        warn "  Each packet must traverse all rules — large lists = CPU overhead"
+        warn "  Fix: use ipset for bulk IP blocks (csf supports this natively)"
+    elif [ "${TOTAL_RULES:-0}" -gt 1000 ]; then
+        warn "Rule count is elevated (${TOTAL_RULES}) — monitor for performance impact"
+    else
+        ok "Rule count is healthy (${TOTAL_RULES} rules)."
     fi
 
-    # Rule counts per chain
-    log_info "Rule counts per chain:"
-    iptables -L --line-numbers -n 2>/dev/null | grep "^Chain" | \
-        while read -r line; do
-            local chain refs
-            chain=$(echo "$line" | awk '{print $2}')
-            refs=$(iptables -L "$chain" -n 2>/dev/null | tail -n +3 | wc -l)
-            printf "  %-30s %s rules\n" "$chain" "$refs"
+    # Per-chain breakdown
+    echo ""
+    info "Rules per chain (non-empty only):"
+    iptables -L -n 2>/dev/null | grep "^Chain" | \
+        while IFS= read -r line; do
+            CHAIN=$(echo "$line" | awk '{print $2}')
+            COUNT=$(iptables -L "$CHAIN" -n 2>/dev/null | tail -n +3 | wc -l)
+            [ "${COUNT:-0}" -gt 0 ] && \
+                printf "    %-30s %s rules\n" "$CHAIN" "$COUNT"
         done
 
-    # Total rule count
-    local total_rules
-    total_rules=$(iptables -L -n 2>/dev/null | grep -c "^[A-Z]" || echo 0)
-    local ip6_rules
-    ip6_rules=$(ip6tables -L -n 2>/dev/null | grep -c "^[A-Z]" || echo 0)
-
-    echo ""
-    log_info "Total iptables rules  : ${total_rules}"
-    log_info "Total ip6tables rules : ${ip6_rules}"
-
-    if [ "$total_rules" -gt 3000 ]; then
-        log_warn "High rule count may impact packet processing performance."
-        log_warn "Consider: ipset-based blocking instead of individual IP rules."
-        _sbuf "IPTABLES WARN: $total_rules rules — performance risk"
-    else
-        log_ok "Rule count is within normal range."
-        _sbuf "iptables rules: $total_rules (OK)"
-    fi
-
-    # Check if ipset is in use (good practice)
+    # ipset
     echo ""
     if command -v ipset &>/dev/null; then
-        local ipset_count
-        ipset_count=$(ipset list 2>/dev/null | grep -c "^Name:" || echo 0)
-        log_info "ipset sets in use: ${ipset_count}"
-        _sbuf "ipset sets: $ipset_count"
+        IPSET_COUNT=$(ipset list 2>/dev/null | grep -c "^Name:" || echo 0)
+        info "ipset sets in use: ${IPSET_COUNT}"
+        if [ "${IPSET_COUNT:-0}" -gt 0 ]; then
+            ipset list 2>/dev/null | \
+                grep -E "^Name:|^Number of entries:" | \
+                paste - - | \
+                while IFS= read -r l; do echo "    $l"; done
+        fi
     else
-        log_dim "ipset not installed (optional optimization for large block lists)"
+        info "ipset not installed — recommended for large block lists"
     fi
-}
+fi
 
 # =============================================================================
-# SECTION 5 — Active connection flood detection (real-time)
+# SECTION 5 — Active Connection Analysis
 # =============================================================================
-section_connection_analysis() {
-    section "5. ACTIVE CONNECTIONS — FLOOD DETECTION"
-    echo ""
+hdr "5. ACTIVE CONNECTION ANALYSIS"
+echo ""
 
-    _sbuf ""
-    _sbuf "=== CONNECTIONS ==="
+SS_OUT=$(ss -s 2>/dev/null)
+TOTAL_CONN=$(echo "$SS_OUT"  | grep "Total:"     | awk '{print $2}')
+ESTAB_CONN=$(echo "$SS_OUT"  | grep -i "estab"   | grep -oE '[0-9]+' | head -1)
+SYN_RECV=$(echo   "$SS_OUT"  | grep -i "synrecv" | grep -oE '[0-9]+' | head -1)
+TIME_WAIT=$(echo  "$SS_OUT"  | grep -i "timewait"| grep -oE '[0-9]+' | head -1)
+CLOSE_WAIT=$(echo "$SS_OUT"  | grep -i "closewait"| grep -oE '[0-9]+' | head -1)
 
-    local total_conn established syn_recv time_wait
-    total_conn=$(ss -s 2>/dev/null | grep "Total:" | awk '{print $2}' || echo 0)
-    established=$(ss -s 2>/dev/null | grep "estab"   | awk '{print $4}' | tr -d ',' || echo 0)
-    syn_recv=$(ss -s 2>/dev/null | grep "synrecv"  | awk '{print $2}' || echo 0)
-    time_wait=$(ss -s 2>/dev/null | grep "timewait" | awk '{print $2}' || echo 0)
+printf "  %-30s %s\n"          "Total connections:"  "${TOTAL_CONN:-?}"
+printf "  %-30s ${G}%s${N}\n"  "Established:"        "${ESTAB_CONN:-?}"
 
-    log_info "Total connections  : ${total_conn}"
-    log_info "Established        : ${established}"
-    log_info "SYN_RECV           : ${syn_recv} $([ "${syn_recv:-0}" -gt 100 ] && echo '◄ POSSIBLE SYN FLOOD')"
-    log_info "TIME_WAIT          : ${time_wait}"
+# SYN_RECV coloring
+SYN_CLR=$G
+[ "${SYN_RECV:-0}" -gt 50  ] && SYN_CLR=$Y
+[ "${SYN_RECV:-0}" -gt 100 ] && SYN_CLR=$R
+printf "  %-30s ${SYN_CLR}%s${N}\n" "SYN_RECV (flood indicator):" "${SYN_RECV:-0}"
+printf "  %-30s %s\n"  "TIME_WAIT:"   "${TIME_WAIT:-0}"
+printf "  %-30s %s\n"  "CLOSE_WAIT:"  "${CLOSE_WAIT:-0}"
 
-    _sbuf "Connections: total=$total_conn estab=$established syn_recv=$syn_recv time_wait=$time_wait"
+echo ""
+if [ "${SYN_RECV:-0}" -gt 100 ]; then
+    crit "SYN_RECV is VERY HIGH (${SYN_RECV}) — SYN flood attack likely in progress"
+    warn "  Immediate: echo 1 > /proc/sys/net/ipv4/tcp_syncookies"
+    warn "  CSF: enable SYNFLOOD and SYNFLOOD_RATE in csf.conf"
+elif [ "${SYN_RECV:-0}" -gt 50 ]; then
+    warn "SYN_RECV is elevated (${SYN_RECV}) — watch closely"
+else
+    ok "SYN_RECV is normal (${SYN_RECV:-0})."
+fi
 
-    if [ "${syn_recv:-0}" -gt 100 ]; then
-        log_crit "SYN_RECV count is HIGH — possible SYN flood attack in progress"
-        _sbuf "SYN FLOOD ALERT: $syn_recv SYN_RECV connections"
-    fi
+# Top source IPs
+echo ""
+info "Top source IPs by active connections:"
+echo ""
+printf "    ${B}%-6s %-18s %-s${N}\n" "CONNS" "IP ADDRESS" "FLAG"
+echo "    ──────────────────────────────────────────────────────────"
+ss -tn state established 2>/dev/null | awk 'NR>1{print $5}' | \
+    grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | \
+    sort | uniq -c | sort -rn | head -12 | \
+    while read -r cnt ip; do
+        CLR=$N; FLAG="—"
+        [ "$cnt" -ge 100 ] && CLR=$R && FLAG="◄ POSSIBLE FLOOD"
+        [ "$cnt" -ge 30  ] && [ "$cnt" -lt 100 ] && CLR=$Y && FLAG="◄ Elevated"
+        printf "    ${CLR}%-6s %-18s %s${N}\n" "$cnt" "$ip" "$FLAG"
+    done
 
-    # Top source IPs by connection count
-    echo ""
-    log_info "Top source IPs by active connections:"
-    ss -tn state established 2>/dev/null | awk 'NR>1 {print $5}' | \
-        cut -d: -f1 | sort | uniq -c | sort -rn | head -10 | \
-        while read -r count ip; do
-            local flag=""
-            [ "$count" -ge 50 ] && flag=" ◄ INVESTIGATE" && color="$C_RED" || color="$C_RESET"
-            printf "${color}  %-6s %s%s${C_RESET}\n" "$count" "$ip" "$flag"
-            _sbuf "  IP: $ip = $count conns$flag"
-        done
-
-    # Ports under heaviest load
-    echo ""
-    log_info "Most active destination ports:"
-    ss -tn state established 2>/dev/null | awk 'NR>1 {print $4}' | \
-        rev | cut -d: -f1 | rev | sort | uniq -c | sort -rn | head -10 | \
-        while read -r count port; do
-            printf "  %-6s port %-6s\n" "$count" "$port"
-        done
-}
+# Busiest ports with service name
+echo ""
+info "Busiest destination ports:"
+echo ""
+ss -tn state established 2>/dev/null | awk 'NR>1{print $4}' | \
+    rev | cut -d: -f1 | rev | \
+    sort | uniq -c | sort -rn | head -12 | \
+    while read -r cnt port; do
+        SVC=""
+        case "$port" in
+            21)   SVC="FTP"                ;;  22)   SVC="SSH"          ;;
+            25)   SVC="SMTP"               ;;  80)   SVC="HTTP"         ;;
+            110)  SVC="POP3"               ;;  143)  SVC="IMAP"         ;;
+            443)  SVC="HTTPS"              ;;  465)  SVC="SMTPS"        ;;
+            587)  SVC="SMTP Submission"    ;;  993)  SVC="IMAPS"        ;;
+            995)  SVC="POP3S"              ;;  2082) SVC="cPanel"       ;;
+            2083) SVC="cPanel SSL"         ;;  2086) SVC="WHM"          ;;
+            2087) SVC="WHM SSL"            ;;  2095) SVC="Webmail"      ;;
+            2096) SVC="Webmail SSL"        ;;  3306) SVC="MySQL"        ;;
+            8080) SVC="HTTP Alt"           ;;  8443) SVC="HTTPS Alt"    ;;
+        esac
+        [ -n "$SVC" ] && SVC=" (${SVC})"
+        printf "    %-6s port %-6s%s\n" "$cnt" "$port" "$SVC"
+    done
 
 # =============================================================================
-# MAIN
+# SECTION 6 — Recommendations & Quick Reference
 # =============================================================================
-main() {
-    header "FIREWALL STATUS REPORT (CSF + Imunify360)"
-    write_log "firewall_status" "Firewall check started"
+hdr "6. RECOMMENDATIONS & QUICK REFERENCE"
+echo ""
 
-    section_csf_status
-    section_lfd_analysis
-    section_imunify_status
-    section_iptables_health
-    section_connection_analysis
+echo -e "  ${B}If under active attack right now:${N}"
+echo ""
+echo -e "  ${C}1.${N} Find attacker IP  → Section 2 (top LFD IPs) or Section 5 (top connections)"
+echo -e "  ${C}2.${N} Check IP details  → bash firewall_status.sh --check <IP>"
+echo -e "  ${C}3.${N} Block immediately → bash firewall_status.sh --block <IP>"
+echo -e "  ${C}4.${N} SYN flood active  → echo 1 > /proc/sys/net/ipv4/tcp_syncookies"
+echo -e "  ${C}5.${N} CSF stopped       → csf -r"
+echo -e "  ${C}6.${N} LFD stopped       → service lfd start"
+echo -e "  ${C}7.${N} Imunify stopped   → systemctl restart imunify360"
+echo ""
 
-    echo ""
-    section "FIREWALL CHECK COMPLETE"
-    log_info "Log saved to: ${LOG_DIR}/firewall_status.log"
-    write_log "firewall_status" "Firewall check complete"
+echo -e "  ${B}Recommended CSF hardening settings (/etc/csf/csf.conf):${N}"
+echo ""
+echo -e "  ${D}SMTP_BLOCK = 1${N}           Block non-Exim outbound SMTP from user processes"
+echo -e "  ${D}LF_SCRIPT_ALERT = 500${N}    Alert when PHP script sends too many emails"
+echo -e "  ${D}CT_LIMIT = 100${N}           Max connections per IP before temp block"
+echo -e "  ${D}PORTFLOOD = 80;tcp;20;5${N}  Port flood protection on HTTP"
+echo -e "  ${D}PS_LIMIT = 10${N}            Port scan detection threshold"
+echo -e "  ${D}LF_SSHD = 5${N}             Block after 5 failed SSH attempts"
+echo -e "  ${D}SYNFLOOD = 1${N}             Enable SYN flood protection"
+echo -e "  ${D}SYNFLOOD_RATE = 100/s${N}    Max SYN packets per second"
+echo ""
 
-    if [ "$POST_SLACK" = true ]; then
-        slack_post "Firewall Status Report" "$SLACK_BUFFER"
-        log_info "Findings posted to Slack."
-    else
-        log_dim "Tip: run with --slack to post findings to Slack"
-    fi
-}
+sep
+echo -e "${B}  QUICK REFERENCE ONE-LINERS${N}"
+sep
+echo ""
+echo -e "  ${D}# Block an IP permanently via CSF:${N}"
+echo    "  csf -d <IP>  \"Reason here\""
+echo ""
+echo -e "  ${D}# Temporary block for 1 hour:${N}"
+echo    "  csf -td <IP> 3600 \"Temp: suspicious activity\""
+echo ""
+echo -e "  ${D}# Unblock an IP (perm + temp):${N}"
+echo    "  csf -dr <IP> && csf -tr <IP>"
+echo ""
+echo -e "  ${D}# Reload all CSF rules:${N}"
+echo    "  csf -r"
+echo ""
+echo -e "  ${D}# Watch LFD log live:${N}"
+echo    "  tail -f /var/log/lfd.log"
+echo ""
+echo -e "  ${D}# View active temp blocks:${N}"
+echo    "  csf -t"
+echo ""
+echo -e "  ${D}# Top attacking IPs in LFD log:${N}"
+echo    "  tail -2000 /var/log/lfd.log | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort | uniq -c | sort -rn | head -20"
+echo ""
+echo -e "  ${D}# All open listening ports:${N}"
+echo    "  ss -tlnp"
+echo ""
+echo -e "  ${D}# Active connections per IP (top 20):${N}"
+echo    "  ss -tn state established | awk 'NR>1{print \$5}' | grep -oE '[0-9.]+' | sort | uniq -c | sort -rn | head -20"
+echo ""
+echo -e "  ${D}# Imunify360 — whitelist an IP:${N}"
+echo    "  imunify360-agent whitelist ip add <IP>"
+echo ""
+echo -e "  ${D}# Imunify360 — blacklist an IP:${N}"
+echo    "  imunify360-agent blacklist ip add --ip <IP> --ttl 0 --comment \"Spam\""
+echo ""
+echo -e "  ${D}# Enable SYN cookies immediately (survives until reboot):${N}"
+echo    "  echo 1 > /proc/sys/net/ipv4/tcp_syncookies"
+echo ""
 
-main "$@"
+sep
+echo -e "${G}${B}  Done — $(date '+%H:%M:%S')${N}"
+sep
+echo ""
