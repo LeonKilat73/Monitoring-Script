@@ -1,359 +1,736 @@
 #!/bin/bash
 # =============================================================================
-# /opt/hostmon/resource_audit.sh
-# =============================================================================
-# PURPOSE: Full resource consumption audit — answers "is this load normal
-#          or do we need to upgrade / optimize / suspend an account?"
+# resource_audit.sh — Self-contained Resource Audit
+# Drop anywhere, run as root. No external dependencies.
 #
-#   - Top cPanel accounts by CPU + RAM combined
-#   - MySQL: slow queries, top databases, connection hogs
-#   - PHP-FPM pool status per account
-#   - Apache/LiteSpeed slot consumption
-#   - Decision helper: upgrade vs optimize vs abuse
+# PURPOSE: Full server resource consumption audit. Answers:
+#   - Which cPanel accounts are putting the most pressure on the server?
+#   - Is this abuse, a legitimate heavy site, or a server capacity problem?
+#   - What is MySQL doing and who is hammering it?
+#   - How are PHP workers distributed across accounts?
+#   - What is RAM actually being used for?
+#   - Should we upgrade, optimize, throttle, or suspend?
 #
 # USAGE:
-#   bash resource_audit.sh                # Full audit
-#   bash resource_audit.sh --user joe     # Single account deep-dive
-#   bash resource_audit.sh --slack        # Also post to Slack
+#   bash resource_audit.sh                  # Full audit
+#   bash resource_audit.sh --user johndoe   # Deep-dive on one account
+#   bash resource_audit.sh --top 20         # Show more accounts (default: 15)
 # =============================================================================
 
-HOSTMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${HOSTMON_DIR}/lib/common.sh"
-require_root
-require_cmds ps awk sort grep
-
 TARGET_USER=""
-POST_SLACK=false
+TOP_COUNT=15
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
-        --user)  TARGET_USER="$2"; shift ;;
-        --slack) POST_SLACK=true ;;
+        --user) TARGET_USER="$2"; shift ;;
+        --top)  TOP_COUNT="$2";   shift ;;
     esac
     shift
 done
 
-SLACK_BUFFER=""
-_sbuf() { SLACK_BUFFER+="$*"$'\n'; }
+# --- Colors
+R='\033[0;31m'; Y='\033[1;33m'; G='\033[0;32m'
+C='\033[0;36m'; B='\033[1m';    D='\033[2m'; N='\033[0m'
+
+# --- Root check
+if [ "$EUID" -ne 0 ]; then
+    echo "Run as root." >&2
+    exit 1
+fi
+
+sep()  { echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"; }
+hdr()  { echo ""; sep; echo -e "${B}  $*${N}"; sep; }
+info() { echo -e "  ${C}•${N} $*"; }
+warn() { echo -e "  ${Y}▲${N} $*"; }
+crit() { echo -e "  ${R}✖${N} $*"; }
+ok()   { echo -e "  ${G}✔${N} $*"; }
+
+HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+CPU_CORES=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo)
+read LOAD1 LOAD5 LOAD15 _ < /proc/loadavg
+MEM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+MEM_AVAIL_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
+MEM_USED_KB=$(( MEM_TOTAL_KB - MEM_AVAIL_KB ))
+MEM_USED_PCT=$(( MEM_USED_KB * 100 / MEM_TOTAL_KB ))
+MEM_TOTAL_MB=$(( MEM_TOTAL_KB / 1024 ))
+MEM_USED_MB=$(( MEM_USED_KB / 1024 ))
+
+echo ""
+echo -e "${B}╔══════════════════════════════════════════════════════════════╗${N}"
+echo -e "${B}  RESOURCE AUDIT — ${HOSTNAME}${N}"
+echo -e "${D}  $(date '+%Y-%m-%d %H:%M:%S')  |  Cores: ${CPU_CORES}  |  Load: ${LOAD1} ${LOAD5} ${LOAD15}${N}"
+echo -e "${D}  RAM: ${MEM_USED_MB}MB / ${MEM_TOTAL_MB}MB used (${MEM_USED_PCT}%)${N}"
+[ -n "$TARGET_USER" ] && echo -e "${D}  Account filter: ${TARGET_USER}${N}"
+echo -e "${B}╚══════════════════════════════════════════════════════════════╝${N}"
 
 # =============================================================================
-# SECTION 1 — Combined resource score per cPanel account
-# Score = CPU% + (MEM% * 0.5) — gives a single "load pressure" number
+# SECTION 1 — Resource Pressure Score per cPanel Account
+# Score = CPU% + (MEM% × 0.5)
+# Gives a single comparable number per account showing total server impact
 # =============================================================================
-section_combined_resource_score() {
-    section "1. RESOURCE PRESSURE SCORE — ALL cPANEL ACCOUNTS"
+hdr "1. RESOURCE PRESSURE SCORE — ALL cPANEL ACCOUNTS"
+echo ""
+echo -e "  ${D}Score = CPU% + (RAM% × 0.5)  —  higher score = more server pressure${N}"
+echo ""
+printf "${B}  %-20s %8s %8s %8s %7s  %-s${N}\n" \
+    "ACCOUNT" "CPU%" "MEM%" "SCORE" "PROCS" "VERDICT"
+echo "  ──────────────────────────────────────────────────────────────────────"
+
+declare -A A_CPU A_MEM A_CNT A_CMD A_SCORE
+
+while IFS= read -r line; do
+    USR=$(echo "$line" | awk '{print $1}')
+    CPU=$(echo "$line" | awk '{print $3}')
+    MEM=$(echo "$line" | awk '{print $4}')
+    CMD=$(echo "$line" | awk '{print $11}')
+    [ -f "/var/cpanel/users/${USR}" ] || continue
+    [ -n "$TARGET_USER" ] && [ "$USR" != "$TARGET_USER" ] && continue
+    A_CPU[$USR]=$(echo "${A_CPU[$USR]:-0} + ${CPU:-0}" | bc 2>/dev/null || echo 0)
+    A_MEM[$USR]=$(echo "${A_MEM[$USR]:-0} + ${MEM:-0}" | bc 2>/dev/null || echo 0)
+    A_CNT[$USR]=$(( ${A_CNT[$USR]:-0} + 1 ))
+    [ -z "${A_CMD[$USR]}" ] && A_CMD[$USR]="$CMD"
+done < <(ps aux | awk 'NR>1')
+
+# Calculate scores
+TOP_ACCOUNT=""
+TOP_SCORE=0
+for USR in "${!A_CPU[@]}"; do
+    A_SCORE[$USR]=$(echo "${A_CPU[$USR]} + (${A_MEM[$USR]} * 0.5)" | \
+                   bc 2>/dev/null | awk '{printf "%.1f", $1}')
+    # Track highest scorer for decision helper
+    SCORE_I=${A_SCORE[$USR]%.*}
+    if [ "${SCORE_I:-0}" -gt "${TOP_SCORE:-0}" ]; then
+        TOP_SCORE=${SCORE_I}
+        TOP_ACCOUNT=$USR
+    fi
+done
+
+for USR in $(for k in "${!A_SCORE[@]}"; do
+                 echo "${A_SCORE[$k]} $k"
+             done | sort -rn | awk '{print $2}' | head -"$TOP_COUNT"); do
+
+    CPU="${A_CPU[$USR]}"
+    MEM="${A_MEM[$USR]}"
+    SCORE="${A_SCORE[$USR]}"
+    CNT="${A_CNT[$USR]}"
+    SCORE_I=${SCORE%.*}
+
+    CLR=$G; VERDICT="Normal"
+    if   [ "${SCORE_I:-0}" -ge 100 ]; then CLR=$R; VERDICT="CRITICAL — investigate now"
+    elif [ "${SCORE_I:-0}" -ge 50  ]; then CLR=$Y; VERDICT="HIGH — likely causing issues"
+    elif [ "${SCORE_I:-0}" -ge 20  ]; then CLR=$C; VERDICT="Elevated — monitor"
+    fi
+
+    printf "${CLR}  %-20s %8s %8s %8s %7s  %-s${N}\n" \
+        "$USR" "${CPU}%" "${MEM}%" "$SCORE" "$CNT" "$VERDICT"
+done
+
+[ -n "$TOP_ACCOUNT" ] && {
     echo ""
-    log_dim "Score = CPU% + (RAM% × 0.5) — higher = more server pressure"
-    echo ""
-
-    _sbuf "=== RESOURCE SCORE ==="
-    _sbuf "$(printf '%-20s %8s %8s %8s %10s' ACCOUNT CPU% MEM% SCORE PROCESSES)"
-
-    printf "${C_BOLD}%-20s %8s %8s %8s %10s  %-s${C_RESET}\n" \
-        "ACCOUNT" "CPU%" "MEM%" "SCORE" "PROCESSES" "VERDICT"
-    echo "──────────────────────────────────────────────────────────────────────"
-
-    declare -A acc_cpu acc_mem acc_pcount
-
-    # Aggregate from ps
-    while IFS= read -r line; do
-        local user cpu mem
-        user=$(echo "$line" | awk '{print $1}')
-        cpu=$(echo "$line"  | awk '{print $3}')
-        mem=$(echo "$line"  | awk '{print $4}')
-
-        [ -f "/var/cpanel/users/${user}" ] || continue
-
-        acc_cpu[$user]=$(echo "${acc_cpu[$user]:-0} + ${cpu:-0}" | bc 2>/dev/null)
-        acc_mem[$user]=$(echo "${acc_mem[$user]:-0} + ${mem:-0}" | bc 2>/dev/null)
-        acc_pcount[$user]=$(( ${acc_pcount[$user]:-0} + 1 ))
-
-    done < <(ps aux | tail -n +2 | \
-             { [ -n "$TARGET_USER" ] && grep "^${TARGET_USER} " || cat; })
-
-    # Calculate scores and sort
-    declare -A acc_score
-    for user in "${!acc_cpu[@]}"; do
-        acc_score[$user]=$(echo "${acc_cpu[$user]} + (${acc_mem[$user]} * 0.5)" | \
-                           bc 2>/dev/null | awk '{printf "%.1f", $1}')
-    done
-
-    for user in $(for k in "${!acc_score[@]}"; do
-                      echo "${acc_score[$k]} $k"
-                  done | sort -rn | awk '{print $2}' | head -"$TOP_ACCOUNTS_COUNT"); do
-
-        local cpu="${acc_cpu[$user]}"
-        local mem="${acc_mem[$user]}"
-        local score="${acc_score[$user]}"
-        local procs="${acc_pcount[$user]}"
-        local score_int=${score%.*}
-
-        # Verdict
-        local verdict color
-        if   [ "${score_int:-0}" -ge 100 ]; then
-            verdict="CRITICAL — suspend/investigate"; color="$C_RED"
-        elif [ "${score_int:-0}" -ge 50 ]; then
-            verdict="HIGH — may need limits/upgrade";  color="$C_YELLOW"
-        elif [ "${score_int:-0}" -ge 20 ]; then
-            verdict="ELEVATED — monitor";               color="$C_CYAN"
-        else
-            verdict="Normal";                           color="$C_GREEN"
-        fi
-
-        printf "${color}%-20s %8s %8s %8s %10s  %-s${C_RESET}\n" \
-            "$user" "${cpu}%" "${mem}%" "$score" "$procs" "$verdict"
-
-        _sbuf "$(printf '%-20s %8s %8s %8s %10s  %-s' \
-            "$user" "${cpu}%" "${mem}%" "$score" "$procs" "$verdict")"
-    done
+    info "Highest pressure account: ${B}${TOP_ACCOUNT}${N} (score: ${TOP_SCORE})"
+    info "Deep-dive: bash resource_audit.sh --user ${TOP_ACCOUNT}"
 }
 
 # =============================================================================
-# SECTION 2 — MySQL resource analysis
+# SECTION 2 — RAM Usage Breakdown
 # =============================================================================
-section_mysql_audit() {
-    section "2. MYSQL RESOURCE AUDIT"
+hdr "2. RAM USAGE BREAKDOWN"
+echo ""
+
+# Overall RAM
+RAM_CLR=$G
+[ "$MEM_USED_PCT" -ge 80 ] && RAM_CLR=$Y
+[ "$MEM_USED_PCT" -ge 95 ] && RAM_CLR=$R
+
+printf "  %-30s ${RAM_CLR}%s MB / %s MB (%s%%)${N}\n" \
+    "RAM Used / Total:" "$MEM_USED_MB" "$MEM_TOTAL_MB" "$MEM_USED_PCT"
+
+# Swap
+SWAP_TOTAL=$(grep SwapTotal /proc/meminfo | awk '{print $2}')
+SWAP_FREE=$(grep SwapFree  /proc/meminfo | awk '{print $2}')
+SWAP_USED=$(( SWAP_TOTAL - SWAP_FREE ))
+SWAP_TOTAL_MB=$(( SWAP_TOTAL / 1024 ))
+SWAP_USED_MB=$(( SWAP_USED / 1024 ))
+
+if [ "$SWAP_TOTAL" -gt 0 ]; then
+    SWAP_PCT=$(( SWAP_USED * 100 / SWAP_TOTAL ))
+    SWAP_CLR=$G
+    [ "$SWAP_PCT" -ge 50 ] && SWAP_CLR=$Y
+    [ "$SWAP_PCT" -ge 80 ] && SWAP_CLR=$R
+    printf "  %-30s ${SWAP_CLR}%s MB / %s MB (%s%%)${N}\n" \
+        "Swap Used / Total:" "$SWAP_USED_MB" "$SWAP_TOTAL_MB" "$SWAP_PCT"
+    [ "$SWAP_PCT" -ge 50 ] && \
+        warn "High swap usage — server is memory-constrained. RAM upgrade recommended."
+else
+    printf "  %-30s %s\n" "Swap:" "Not configured"
+fi
+
+# Top RAM consumers by process
+echo ""
+info "Top processes by RAM usage:"
+echo ""
+printf "  ${B}%-7s %-14s %6s %6s  %-s${N}\n" "PID" "USER" "%MEM" "RSS MB" "COMMAND"
+echo "  ──────────────────────────────────────────────────────────────────"
+ps aux --sort=-%mem | awk 'NR>1' | head -12 | \
+while IFS= read -r line; do
+    PID=$(echo "$line" | awk '{print $2}')
+    USR=$(echo "$line" | awk '{print $1}')
+    MEM=$(echo "$line" | awk '{print $4}')
+    RSS=$(echo "$line" | awk '{print $6}')
+    RSS_MB=$(( ${RSS:-0} / 1024 ))
+    CMD=$(cat /proc/$PID/cmdline 2>/dev/null | tr '\0' ' ' | cut -c1-55)
+    [ -z "$CMD" ] && CMD=$(echo "$line" | awk '{print $11}')
+    CPANEL_TAG=""
+    [ -f "/var/cpanel/users/${USR}" ] && CPANEL_TAG=" [cP]"
+    MEM_I=${MEM%.*}
+    CLR=$N
+    [ "${MEM_I:-0}" -ge 10 ] && CLR=$Y
+    [ "${MEM_I:-0}" -ge 20 ] && CLR=$R
+    printf "${CLR}  %-7s %-14s %6s %6s  %-s${N}%s\n" \
+        "$PID" "$USR" "$MEM" "$RSS_MB" "$CMD" "$CPANEL_TAG"
+done
+
+# Top cPanel accounts by RAM
+echo ""
+info "Top cPanel accounts by total RAM:"
+echo ""
+printf "  ${B}%-20s %8s %10s${N}\n" "ACCOUNT" "TOT MEM%" "APPROX MB"
+echo "  ──────────────────────────────────────────────────────────────────"
+for USR in $(for k in "${!A_MEM[@]}"; do
+                 echo "${A_MEM[$k]} $k"
+             done | sort -rn | awk '{print $2}' | head -10); do
+    MEM="${A_MEM[$USR]}"
+    MEM_I=${MEM%.*}
+    APPROX_MB=$(echo "$MEM_I * $MEM_TOTAL_MB / 100" | bc 2>/dev/null || echo "?")
+    CLR=$N
+    [ "${MEM_I:-0}" -ge 20 ] && CLR=$Y
+    [ "${MEM_I:-0}" -ge 40 ] && CLR=$R
+    printf "${CLR}  %-20s %8s %10s MB${N}\n" "$USR" "${MEM}%" "$APPROX_MB"
+done
+
+# =============================================================================
+# SECTION 3 — MySQL Resource Audit
+# =============================================================================
+hdr "3. MYSQL RESOURCE AUDIT"
+echo ""
+
+if ! pgrep -xE "mysqld|mariadbd" &>/dev/null; then
+    warn "MySQL/MariaDB is not running."
+elif ! mysql -e "SELECT 1;" &>/dev/null 2>&1; then
+    warn "Cannot connect to MySQL. Create /root/.my.cnf:"
     echo ""
+    echo -e "    ${D}cat > /root/.my.cnf << EOF${N}"
+    echo -e "    ${D}[client]${N}"
+    echo -e "    ${D}user=root${N}"
+    echo -e "    ${D}password=YOUR_PASSWORD${N}"
+    echo -e "    ${D}EOF${N}"
+    echo -e "    ${D}chmod 600 /root/.my.cnf${N}"
+else
+    # MySQL CPU usage
+    MYSQL_CPU=$(ps aux | grep -E 'mysqld|mariadbd' | grep -v grep | \
+                awk '{sum+=$3} END {printf "%.1f", sum+0}')
+    MYSQL_MEM=$(ps aux | grep -E 'mysqld|mariadbd' | grep -v grep | \
+                awk '{sum+=$4} END {printf "%.1f", sum+0}')
+    MYSQL_CLR=$G
+    [ "$(echo "$MYSQL_CPU > 40" | bc -l)" = "1" ] && MYSQL_CLR=$Y
+    [ "$(echo "$MYSQL_CPU > 80" | bc -l)" = "1" ] && MYSQL_CLR=$R
+    echo -e "  MySQL process CPU: ${MYSQL_CLR}${MYSQL_CPU}%${N}  RAM: ${MYSQL_MEM}%"
 
-    _sbuf ""
-    _sbuf "=== MYSQL ==="
-
-    if ! pgrep -x mysqld &>/dev/null && ! pgrep -x mariadbd &>/dev/null; then
-        log_warn "MySQL/MariaDB is not running."
-        return
-    fi
-
-    if ! mysql -e "SELECT 1;" &>/dev/null; then
-        log_warn "Cannot connect to MySQL. Ensure /root/.my.cnf exists with correct credentials."
-        return
-    fi
-
-    # --- Global status snapshot
-    log_info "MySQL key metrics:"
+    # Key status metrics
+    echo ""
+    info "MySQL global status (key metrics):"
+    echo ""
+    printf "  ${B}%-40s %s${N}\n" "METRIC" "VALUE"
+    echo "  ──────────────────────────────────────────────────────────────────"
     mysql -e "SHOW GLOBAL STATUS;" 2>/dev/null | \
-        grep -E "^(Threads_connected|Threads_running|Questions|Slow_queries|\
-Max_used_connections|Aborted_connects|Table_locks_waited|Innodb_buffer_pool_reads)" | \
+        grep -E "^(Threads_connected|Threads_running|Slow_queries|Questions|\
+Max_used_connections|Aborted_connects|Table_locks_waited|\
+Innodb_buffer_pool_reads|Innodb_buffer_pool_read_requests|\
+Created_tmp_disk_tables|Handler_read_rnd_next)" | \
         while IFS=$'\t' read -r key val; do
-            printf "  %-40s %s\n" "$key" "$val"
+            # Flag concerning values
+            CLR=$N; FLAG=""
+            case "$key" in
+                Slow_queries)
+                    [ "${val:-0}" -gt 100 ] && CLR=$Y && FLAG=" ◄ HIGH"  ;;
+                Table_locks_waited)
+                    [ "${val:-0}" -gt 0   ] && CLR=$Y && FLAG=" ◄ LOCK CONTENTION" ;;
+            esac
+            printf "${CLR}  %-40s %s%s${N}\n" "$key" "$val" "$FLAG"
         done
 
-    # --- Databases by size
+    # Connection capacity
     echo ""
-    log_info "Top databases by size:"
-    mysql -e "
-        SELECT table_schema AS 'Database',
-               ROUND(SUM(data_length + index_length) / 1024 / 1024, 1) AS 'Size_MB'
-        FROM information_schema.tables
-        GROUP BY table_schema
-        ORDER BY Size_MB DESC LIMIT 15;" 2>/dev/null | \
-        while IFS=$'\t' read -r db size; do
-            printf "  %-40s %s MB\n" "$db" "$size"
-        done
+    THREADS_CONN=$(mysql -e "SHOW STATUS LIKE 'Threads_connected';" 2>/dev/null | \
+                   awk 'NR==2{print $2}')
+    MAX_CONN=$(mysql -e "SHOW VARIABLES LIKE 'max_connections';" 2>/dev/null | \
+               awk 'NR==2{print $2}')
+    if [ -n "$THREADS_CONN" ] && [ -n "$MAX_CONN" ] && [ "$MAX_CONN" -gt 0 ]; then
+        CONN_PCT=$(( THREADS_CONN * 100 / MAX_CONN ))
+        CONN_CLR=$G
+        [ "$CONN_PCT" -ge 70 ] && CONN_CLR=$Y
+        [ "$CONN_PCT" -ge 90 ] && CONN_CLR=$R
+        printf "  %-40s ${CONN_CLR}%s / %s (%s%%)${N}\n" \
+            "Connections used/max:" "$THREADS_CONN" "$MAX_CONN" "$CONN_PCT"
+        [ "$CONN_PCT" -ge 80 ] && \
+            warn "MySQL connections near capacity — risk of 'Too many connections' errors"
+    fi
 
-    # --- Active slow queries (running > 5 seconds)
+    # InnoDB buffer pool hit ratio
     echo ""
-    log_info "Active queries running > 5 seconds:"
-    local slow_found=0
-    mysql -e "SHOW FULL PROCESSLIST;" 2>/dev/null | \
-        awk 'NR>1 && $7 > 5 && $8 != "Sleep"' | \
-        while IFS=$'\t' read -r id user host db cmd time state info; do
-            log_warn "  ID: $id | User: $user | DB: $db | Time: ${time}s | Query: ${info:0:80}"
-            _sbuf "  SLOW QUERY: user=$user db=$db time=${time}s"
-            slow_found=$((slow_found + 1))
-        done
-    [ "$slow_found" -eq 0 ] && log_ok "No slow queries running."
+    READS=$(mysql -e "SHOW STATUS LIKE 'Innodb_buffer_pool_reads';" \
+            2>/dev/null | awk 'NR==2{print $2}')
+    READ_REQS=$(mysql -e "SHOW STATUS LIKE 'Innodb_buffer_pool_read_requests';" \
+                2>/dev/null | awk 'NR==2{print $2}')
+    if [ -n "$READS" ] && [ -n "$READ_REQS" ] && [ "${READ_REQS:-0}" -gt 0 ]; then
+        HIT_RATIO=$(echo "scale=2; (1 - $READS/$READ_REQS) * 100" | bc 2>/dev/null)
+        HIT_CLR=$G
+        [ "$(echo "$HIT_RATIO < 95" | bc -l 2>/dev/null)" = "1" ] && HIT_CLR=$Y
+        [ "$(echo "$HIT_RATIO < 90" | bc -l 2>/dev/null)" = "1" ] && HIT_CLR=$R
+        printf "  %-40s ${HIT_CLR}%s%%${N}\n" "InnoDB buffer pool hit ratio:" "$HIT_RATIO"
+        [ "$(echo "$HIT_RATIO < 95" | bc -l 2>/dev/null)" = "1" ] && \
+            warn "Low buffer pool hit ratio — consider increasing innodb_buffer_pool_size"
+    fi
 
-    # --- Map MySQL users to cPanel accounts
+    # Slow / active queries
     echo ""
-    log_info "MySQL users with most active connections:"
-    mysql -e "SELECT user, COUNT(*) as connections, SUM(time) as total_time
+    info "Active queries running > 5 seconds:"
+    SLOW_Q=$(mysql -e "SHOW FULL PROCESSLIST;" 2>/dev/null | \
+             awk -F'\t' 'NR>1 && $7+0 > 5 && $5 != "Sleep"')
+    if [ -n "$SLOW_Q" ]; then
+        echo ""
+        printf "  ${B}%-6s %-15s %-15s %6s  %-s${N}\n" "ID" "USER" "DB" "TIME(s)" "QUERY"
+        echo "  ──────────────────────────────────────────────────────────────────"
+        echo "$SLOW_Q" | while IFS=$'\t' read -r id usr host db cmd tm state info; do
+            warn "  %-6s %-15s %-15s %6s  %-s" "$id" "$usr" "$db" "$tm" "${info:0:60}"
+        done
+    else
+        ok "No active queries running > 5 seconds."
+    fi
+
+    # Top connections per cPanel user
+    echo ""
+    info "MySQL connections by cPanel account:"
+    mysql -e "SELECT user, COUNT(*) AS conns, SUM(time) AS total_time
               FROM information_schema.processlist
-              WHERE user NOT IN ('root','system user','event_scheduler')
-              GROUP BY user ORDER BY connections DESC LIMIT 10;" 2>/dev/null | \
-        while IFS=$'\t' read -r user conns time; do
-            # Try to map mysql user prefix to cpanel account (cpanel uses user_dbname)
-            local cpanel_account
-            cpanel_account=$(echo "$user" | cut -c1-8)
-            printf "  %-20s %-6s connections, total_time: %ss (acct: %s)\n" \
-                "$user" "$conns" "$time" "$cpanel_account"
+              WHERE user NOT IN ('root','system user','event_scheduler','rdsadmin')
+              GROUP BY user ORDER BY conns DESC LIMIT 12;" 2>/dev/null | \
+        tail -n +2 | \
+        while IFS=$'\t' read -r usr conns total_time; do
+            # cPanel DB users are prefixed with up to 8 chars of account name
+            ACCT_PREFIX=$(echo "$usr" | cut -c1-8)
+            printf "    %-20s %4s conns  total_time: %ss  (account prefix: %s)\n" \
+                "$usr" "$conns" "${total_time:-0}" "$ACCT_PREFIX"
         done
-}
 
-# =============================================================================
-# SECTION 3 — PHP-FPM pool status
-# =============================================================================
-section_php_fpm_audit() {
-    section "3. PHP-FPM POOL STATUS"
+    # Top databases by size
     echo ""
+    info "Top databases by size:"
+    echo ""
+    printf "  ${B}%-40s %12s${N}\n" "DATABASE" "SIZE"
+    echo "  ──────────────────────────────────────────────────────────────────"
+    mysql -e "
+        SELECT table_schema,
+               ROUND(SUM(data_length + index_length)/1024/1024, 1) AS size_mb
+        FROM information_schema.tables
+        WHERE table_schema NOT IN
+            ('information_schema','performance_schema','mysql','sys')
+        GROUP BY table_schema
+        ORDER BY size_mb DESC LIMIT 15;" 2>/dev/null | tail -n +2 | \
+        while IFS=$'\t' read -r db size; do
+            SIZE_I=${size%.*}
+            CLR=$N
+            [ "${SIZE_I:-0}" -ge 1000 ] && CLR=$Y
+            [ "${SIZE_I:-0}" -ge 5000 ] && CLR=$R
+            printf "${CLR}  %-40s %10s MB${N}\n" "$db" "$size"
+        done
+fi
 
-    _sbuf ""
-    _sbuf "=== PHP-FPM ==="
+# =============================================================================
+# SECTION 4 — PHP Workers & Process Audit
+# =============================================================================
+hdr "4. PHP WORKERS & PROCESS AUDIT"
+echo ""
 
-    # Find all PHP-FPM socket/status paths
-    local status_found=0
-    for php_ver in 5.6 7.0 7.1 7.2 7.3 7.4 8.0 8.1 8.2 8.3; do
-        local fpm_status_path="/opt/cpanel/ea-php${php_ver/./}/root/usr/sbin/php-fpm"
-        local socket_path="/var/run/ea-php${php_ver/./}-php-fpm.sock"
+# PHP version counts in use
+info "PHP processes by type and version:"
+echo ""
+printf "  ${B}%-35s %s${N}\n" "PHP HANDLER" "COUNT"
+echo "  ──────────────────────────────────────────────────────────────────"
 
-        if [ -S "$socket_path" ]; then
-            log_info "PHP ${php_ver} FPM socket found: $socket_path"
+# lsphp (LiteSpeed PHP)
+LSPHP_COUNT=$(ps aux | grep -c "[l]sphp" || echo 0)
+[ "${LSPHP_COUNT:-0}" -gt 0 ] && \
+    printf "  %-35s %s\n" "lsphp (LiteSpeed):" "$LSPHP_COUNT"
 
-            # Query status via curl to the socket (if status page enabled)
-            local fpm_status
-            fpm_status=$(curl -s --unix-socket "$socket_path" \
-                         "http://localhost/status?full" 2>/dev/null | head -30)
+# PHP-FPM per version
+for VER in 54 55 56 70 71 72 73 74 80 81 82 83; do
+    VER_DOT="${VER:0:1}.${VER:1}"
+    COUNT=$(ps aux | grep -c "[e]a-php${VER}" || echo 0)
+    [ "${COUNT:-0}" -gt 0 ] && \
+        printf "  %-35s %s\n" "PHP-FPM ${VER_DOT} (ea-php${VER}):" "$COUNT"
+done
 
-            if [ -n "$fpm_status" ]; then
-                echo "$fpm_status" | grep -E "pool:|active processes:|idle processes:|max children reached" | \
-                    while read -r l; do log_dim "    $l"; done
-                status_found=$((status_found + 1))
-            fi
+# PHP-CGI
+PHP_CGI=$(ps aux | grep -c "[p]hp-cgi" || echo 0)
+[ "${PHP_CGI:-0}" -gt 0 ] && \
+    printf "  %-35s %s\n" "PHP-CGI:" "$PHP_CGI"
+
+# PHP CLI (often abuse indicator)
+PHP_CLI=$(ps aux | grep "[p]hp " | grep -v "fpm\|cgi" | wc -l)
+PHP_CLI_CLR=$N
+[ "${PHP_CLI:-0}" -ge 5  ] && PHP_CLI_CLR=$Y
+[ "${PHP_CLI:-0}" -ge 20 ] && PHP_CLI_CLR=$R
+printf "  %-35s ${PHP_CLI_CLR}%s${N}\n" "PHP CLI (scripts/abuse indicator):" "$PHP_CLI"
+
+# lsphp by account
+if [ "${LSPHP_COUNT:-0}" -gt 0 ]; then
+    echo ""
+    info "lsphp workers grouped by cPanel account:"
+    echo ""
+    printf "  ${B}%-20s %8s  %-s${N}\n" "ACCOUNT" "WORKERS" "TOP SCRIPT"
+    echo "  ──────────────────────────────────────────────────────────────────"
+    ps aux | grep "[l]sphp" | awk '{print $1}' | \
+        sort | uniq -c | sort -rn | head -15 | \
+        while read -r cnt usr; do
+            # Get top script for this user
+            TOP_SCRIPT=$(ps aux | grep "[l]sphp" | grep "^${usr} " | \
+                         grep -oE '/home/[^/]+/[^ ]+' | head -1 | \
+                         sed "s|/home/${usr}/||" | cut -c1-40)
+            CLR=$N
+            [ "$cnt" -ge 20 ] && CLR=$Y
+            [ "$cnt" -ge 50 ] && CLR=$R
+            printf "${CLR}  %-20s %8s  %-s${N}\n" "$usr" "$cnt" "${TOP_SCRIPT:-—}"
+        done
+fi
+
+# Long-running PHP CLI (> 2 min — spam scripts, scrapers, crypto miners)
+echo ""
+info "Long-running PHP CLI processes (>2 min — investigate these):"
+LONG_PHP_FOUND=0
+ps aux | grep "[p]hp " | grep -vE "fpm|cgi" | \
+    while IFS= read -r line; do
+        PID=$(echo "$line"  | awk '{print $2}')
+        USR=$(echo "$line"  | awk '{print $1}')
+        CPU=$(echo "$line"  | awk '{print $3}')
+        ETIME=$(echo "$line" | awk '{print $10}')
+        # Parse elapsed time
+        MINS=$(echo "$ETIME" | awk -F: '{
+            if(NF==3) print $1*60+$2
+            else if(NF==2) print $1
+            else print 0}')
+        if [ "${MINS:-0}" -ge 2 ]; then
+            CMD=$(cat /proc/$PID/cmdline 2>/dev/null | tr '\0' ' ' | cut -c1-70)
+            warn "  PID: $PID | User: $USR | CPU: ${CPU}% | Elapsed: $ETIME"
+            echo -e "    ${D}$CMD${N}"
+            LONG_PHP_FOUND=$((LONG_PHP_FOUND + 1))
         fi
     done
+[ "$LONG_PHP_FOUND" -eq 0 ] && ok "No long-running PHP CLI processes found."
 
-    # Fallback: count PHP-FPM processes per version
-    if [ "$status_found" -eq 0 ]; then
-        log_info "PHP-FPM process counts by version:"
-        ps aux | grep php-fpm | grep -v grep | \
-            awk '{print $11}' | sort | uniq -c | sort -rn | \
-            while read -r count cmd; do
-                printf "  %-5s %s\n" "$count" "$cmd"
-                _sbuf "  PHP-FPM: $count x $cmd"
-            done
+# PHP-FPM socket status (if available)
+echo ""
+info "PHP-FPM pool status (via sockets):"
+FPM_FOUND=0
+for VER in 54 55 56 70 71 72 73 74 80 81 82 83; do
+    SOCK="/var/run/ea-php${VER}-php-fpm.sock"
+    [ -S "$SOCK" ] || continue
+    VER_DOT="${VER:0:1}.${VER:1}"
+    FPM_STATUS=$(curl -s --unix-socket "$SOCK" \
+                 "http://localhost/status" 2>/dev/null)
+    if [ -n "$FPM_STATUS" ]; then
+        echo ""
+        echo -e "    ${B}PHP ${VER_DOT} FPM:${N}"
+        echo "$FPM_STATUS" | \
+            grep -E "pool:|active processes:|idle processes:|max children reached|listen queue" | \
+            while IFS= read -r l; do echo "      $l"; done
+        FPM_FOUND=$((FPM_FOUND + 1))
+    fi
+done
+[ "$FPM_FOUND" -eq 0 ] && \
+    info "No PHP-FPM status pages reachable (status page may not be configured)"
+
+# =============================================================================
+# SECTION 5 — CloudLinux LVE Audit (if available)
+# =============================================================================
+hdr "5. CLOUDLINUX LVE AUDIT"
+echo ""
+
+if ! command -v lvectl &>/dev/null && ! command -v lveinfo &>/dev/null; then
+    warn "CloudLinux LVE tools not found (lvectl/lveinfo)"
+    info "If CloudLinux is installed: check WHM → CloudLinux → LVE Manager"
+else
+    # LVE historical — top CPU and memory users
+    if command -v lveinfo &>/dev/null; then
+        info "LVE top CPU consumers (last 1 hour):"
+        echo ""
+        lveinfo --period=1h --by-cpu --limit=12 \
+            --show-columns=user,aCPU,mCPU,lCPU,aEP,mEP,aVMem,mVMem \
+            2>/dev/null || warn "lveinfo returned no data (lve-stats may not be running)"
+
+        echo ""
+        info "LVE top memory consumers (last 1 hour):"
+        echo ""
+        lveinfo --period=1h --by-mem --limit=12 \
+            --show-columns=user,aVMem,mVMem,lVMem,aCPU,aEP \
+            2>/dev/null || true
     fi
 
-    # Long-running PHP CLI (potential abuse — report from cpu_investigate too)
+    # Live LVE snapshot
+    if command -v lveps &>/dev/null; then
+        echo ""
+        info "Live LVE snapshot (lveps):"
+        echo ""
+        lveps --show-cpu 2>/dev/null | head -20 || \
+            warn "lveps returned no output"
+    elif [ -f /var/lve/info ]; then
+        echo ""
+        info "Live LVE data (/var/lve/info):"
+        echo ""
+        printf "  ${B}%-20s %8s %8s %6s %6s${N}\n" "UID/USER" "CPU%" "MEM" "EP" "NPROC"
+        echo "  ──────────────────────────────────────────────────────────────────"
+        awk -F: 'NR>1 && $2>0 {
+            printf "  %-20s %8s %8s %6s %6s\n", $1, $2, $3, $7, $6
+        }' /var/lve/info 2>/dev/null | sort -k2 -rn | head -15
+    fi
+
+    # Accounts hitting LVE limits
     echo ""
-    log_info "PHP CLI processes running > 2 minutes (potential abuse):"
-    local found=0
-    ps aux | grep "php " | grep -v "php-fpm\|php-cgi\|grep" | \
-        while IFS= read -r line; do
-            local pid elapsed user cmd
-            pid=$(echo "$line"     | awk '{print $2}')
-            user=$(echo "$line"    | awk '{print $1}')
-            elapsed=$(echo "$line" | awk '{print $11}')
-            cmd=$(cat /proc/"$pid"/cmdline 2>/dev/null | tr '\0' ' ' | cut -c1-80)
-            local mins
-            mins=$(echo "$elapsed" | awk -F: '{if(NF==3) print $1*60+$2; else print $1}')
-            if [ "${mins:-0}" -ge 2 ]; then
-                log_warn "  PID $pid | User: $user | Elapsed: $elapsed"
-                log_dim  "  $cmd"
-                _sbuf "  LONG PHP CLI: pid=$pid user=$user elapsed=$elapsed"
-                found=$((found + 1))
-            fi
+    info "Accounts hitting LVE limits (fault events in last 1h):"
+    if command -v lveinfo &>/dev/null; then
+        lveinfo --period=1h --limit=10 \
+            --show-columns=user,mCPU,mEP,mVMem,lCPU,lEP,lVMem \
+            --by-fault=cpu 2>/dev/null | head -15 || true
+    fi
+fi
+
+# =============================================================================
+# SECTION 6 — Web Server Slot Usage
+# =============================================================================
+hdr "6. WEB SERVER SLOT USAGE"
+echo ""
+
+WS=""; WS_BIN=""
+if   pgrep -x lshttpd  &>/dev/null; then WS="LiteSpeed"; WS_BIN="lshttpd"
+elif pgrep -x httpd    &>/dev/null; then WS="Apache";    WS_BIN="httpd"
+elif pgrep -x apache2  &>/dev/null; then WS="Apache";    WS_BIN="apache2"
+fi
+
+if [ -z "$WS" ]; then
+    warn "No Apache/LiteSpeed process detected."
+else
+    WS_COUNT=$(pgrep -c "$WS_BIN" 2>/dev/null || echo 0)
+    WS_CPU=$(ps aux | grep "$WS_BIN" | grep -v grep | \
+             awk '{sum+=$3} END {printf "%.1f", sum+0}')
+    WS_MEM=$(ps aux | grep "$WS_BIN" | grep -v grep | \
+             awk '{sum+=$4} END {printf "%.1f", sum+0}')
+
+    info "Web server  : $WS"
+    info "Workers     : $WS_COUNT processes"
+    info "CPU total   : ${WS_CPU}%"
+    info "RAM total   : ${WS_MEM}%"
+
+    # Apache server-status
+    echo ""
+    ASTATUS=$(curl -sk --max-time 3 "http://127.0.0.1/server-status?auto" 2>/dev/null)
+    if [ -n "$ASTATUS" ]; then
+        info "Apache server-status:"
+        echo "$ASTATUS" | \
+            grep -E "BusyWorkers|IdleWorkers|ReqPerSec|BytesPerSec|Uptime" | \
+            while IFS= read -r l; do echo "    $l"; done
+    fi
+
+    # Workers per user
+    echo ""
+    info "Web server workers per cPanel account:"
+    echo ""
+    printf "  ${B}%-20s %8s${N}\n" "ACCOUNT" "WORKERS"
+    echo "  ──────────────────────────────────────────────────────────────────"
+    ps aux | grep "$WS_BIN" | grep -v grep | \
+        awk '{print $1}' | sort | uniq -c | sort -rn | head -15 | \
+        while read -r cnt usr; do
+            CLR=$N
+            [ "$cnt" -ge 20 ] && CLR=$Y
+            [ "$cnt" -ge 50 ] && CLR=$R
+            printf "${CLR}  %-20s %8s${N}\n" "$usr" "$cnt"
         done
-    [ "$found" -eq 0 ] && log_ok "No long-running PHP CLI processes."
-}
+fi
 
 # =============================================================================
-# SECTION 4 — Decision helper: Upgrade vs Optimize vs Abuse
+# SECTION 7 — Decision Helper: Upgrade vs Optimize vs Abuse
 # =============================================================================
-section_decision_helper() {
-    section "4. ADMIN DECISION HELPER"
-    echo ""
+hdr "7. DECISION HELPER — WHAT ACTION TO TAKE"
+echo ""
 
-    _sbuf ""
-    _sbuf "=== DECISION HELPER ==="
+CPU_TOTAL=$(ps aux | awk 'NR>1 {sum+=$3} END {printf "%.0f", sum+0}')
+LOAD1_INT=${LOAD1%.*}
+LOAD_MULTI=$(echo "scale=1; $LOAD1 / $CPU_CORES" | bc 2>/dev/null || echo "?")
 
-    log_info "Analyzing patterns to suggest next action..."
-    echo ""
+printf "  ${B}%-35s %s${N}\n" "METRIC" "VALUE"
+echo "  ──────────────────────────────────────────────────────────────────"
+printf "  %-35s %s%%\n"    "Total CPU across all procs:"  "$CPU_TOTAL"
+printf "  %-35s %s%%\n"    "Total RAM used:"               "$MEM_USED_PCT"
+printf "  %-35s %s\n"      "Load average (1m/5m/15m):"    "$LOAD1 / $LOAD5 / $LOAD15"
+printf "  %-35s %s cores\n" "CPU cores:"                  "$CPU_CORES"
+printf "  %-35s %sx\n"     "Load multiplier (load/cores):" "$LOAD_MULTI"
+[ -n "$TOP_ACCOUNT" ] && \
+printf "  %-35s %s (score: %s)\n" "Highest pressure account:" "$TOP_ACCOUNT" "$TOP_SCORE"
 
-    local cpu_total mem_total load_1min cpu_cores
-    cpu_total=$(ps aux | awk 'NR>1 {sum+=$3} END {printf "%.0f", sum}')
-    mem_total=$(ps aux | awk 'NR>1 {sum+=$4} END {printf "%.0f", sum}')
-    cpu_cores=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo)
-    read load_1min _ < /proc/loadavg
+echo ""
+sep
+echo -e "${B}  DIAGNOSIS${N}"
+sep
+echo ""
 
-    local high_load_multiplier
-    high_load_multiplier=$(echo "$load_1min / $cpu_cores" | bc -l | awk '{printf "%.1f", $1}')
+ISSUES=0
 
-    printf "${C_BOLD}  %-30s %s${C_RESET}\n" "Metric" "Value"
-    echo "  ──────────────────────────────────────────────"
-    printf "  %-30s %s%%\n"  "Total CPU% across procs"  "$cpu_total"
-    printf "  %-30s %s%%\n"  "Total MEM% across procs"  "$mem_total"
-    printf "  %-30s %s\n"    "Load average (1m)"         "$load_1min"
-    printf "  %-30s %s cores\n" "CPU cores"              "$cpu_cores"
-    printf "  %-30s %sx\n"   "Load multiplier"           "$high_load_multiplier"
+# --- Single account abuse
+if [ -n "$TOP_ACCOUNT" ] && [ "${TOP_SCORE:-0}" -ge 80 ]; then
+    crit "Account ${TOP_ACCOUNT} has pressure score ${TOP_SCORE} — likely the culprit"
+    echo -e "    ${Y}→${N} Run: bash cpu_investigate.sh --user ${TOP_ACCOUNT}"
+    echo -e "    ${Y}→${N} Check for brute force, spam scripts, or runaway processes"
+    echo -e "    ${Y}→${N} Throttle via LVE: lvectl set ${TOP_ACCOUNT} --speed=50% --ncpu=1"
+    echo -e "    ${Y}→${N} Or suspend: whmapi1 suspendacct user=${TOP_ACCOUNT} reason='Resource abuse'"
+    ISSUES=$((ISSUES + 1))
+fi
 
-    echo ""
-    echo -e "  ${C_BOLD}Recommended Actions:${C_RESET}"
+# --- High load vs cores
+if [ "${LOAD1_INT:-0}" -ge $(( CPU_CORES * 3 )) ]; then
+    crit "Load ${LOAD1} is 3x+ core count — server severely overloaded"
+    echo -e "    ${Y}→${N} This is beyond normal spikes — identify and suspend top account above"
+    echo -e "    ${Y}→${N} Check for DDoS or brute force: bash firewall_status.sh"
+    ISSUES=$((ISSUES + 1))
+elif [ "${LOAD1_INT:-0}" -ge "$CPU_CORES" ]; then
+    warn "Load ${LOAD1} exceeds core count (${CPU_CORES})"
+    echo -e "    ${Y}→${N} Monitor — if persistent over 15m, investigate top account"
+    ISSUES=$((ISSUES + 1))
+else
+    ok "Load is within acceptable range for ${CPU_CORES} cores."
+fi
 
-    # --- Pattern-based suggestions
-    local load_int=${high_load_multiplier%.*}
+# --- RAM pressure
+if [ "$MEM_USED_PCT" -ge 95 ]; then
+    crit "RAM at ${MEM_USED_PCT}% — OOM killer risk"
+    echo -e "    ${Y}→${N} Immediate: identify top RAM account above and throttle/migrate"
+    echo -e "    ${Y}→${N} Check MySQL innodb_buffer_pool_size — may be oversized"
+    echo -e "    ${Y}→${N} Long-term: RAM upgrade or migrate heavy accounts to VPS"
+    ISSUES=$((ISSUES + 1))
+elif [ "$MEM_USED_PCT" -ge 80 ]; then
+    warn "RAM at ${MEM_USED_PCT}% — elevated"
+    echo -e "    ${Y}→${N} Optimize MySQL buffer pool and PHP memory limits"
+    echo -e "    ${Y}→${N} Consider migrating top RAM accounts to VPS plans"
+    ISSUES=$((ISSUES + 1))
+fi
 
-    # CPU overloaded but RAM OK → likely single account CPU abuse or runaway PHP
-    if [ "$cpu_total" -ge 200 ] && [ "$mem_total" -lt 80 ]; then
-        log_warn "  → CPU overloaded with normal RAM: likely single account abuse or runaway process"
-        log_warn "    Action: Run cpu_investigate.sh --slack to identify culprit"
-        _sbuf "SUGGEST: CPU abuse investigation"
-    fi
+# --- Swap in use
+if [ "${SWAP_TOTAL:-0}" -gt 0 ] && [ "${SWAP_PCT:-0}" -ge 50 ]; then
+    crit "Swap at ${SWAP_PCT}% — system is memory-swapping"
+    echo -e "    ${Y}→${N} Server is RAM-constrained. Processes are using slow disk swap."
+    echo -e "    ${Y}→${N} Action: RAM upgrade is the correct fix here"
+    echo -e "    ${Y}→${N} Short-term: migrate heaviest RAM accounts to dedicated VPS"
+    ISSUES=$((ISSUES + 1))
+fi
 
-    # Both CPU and RAM high → genuine server capacity issue
-    if [ "$cpu_total" -ge 150 ] && [ "$mem_total" -ge 80 ]; then
-        log_crit "  → Both CPU and RAM are under heavy load"
-        log_crit "    Action: Consider server upgrade or migrating heavy accounts to dedicated VPS"
-        _sbuf "SUGGEST: Server upgrade or account migration"
-    fi
+# --- Both CPU and RAM high → capacity issue
+if [ "${CPU_TOTAL:-0}" -ge 150 ] && [ "$MEM_USED_PCT" -ge 80 ]; then
+    crit "Both CPU and RAM are under heavy sustained load"
+    echo -e "    ${Y}→${N} Pattern: server is genuinely at capacity, not just one bad account"
+    echo -e "    ${Y}→${N} Action: migrate top 3-5 heaviest accounts to VPS/cloud"
+    echo -e "    ${Y}→${N} Or: upgrade server CPU/RAM"
+    ISSUES=$((ISSUES + 1))
+fi
 
-    # Load very high relative to cores → too many concurrent processes
-    if [ "${load_int:-0}" -ge 3 ]; then
-        log_warn "  → Load is ${high_load_multiplier}x CPU cores — too many concurrent processes"
-        log_warn "    Action: Review PHP-FPM max_children, Apache MaxRequestWorkers, MySQL max_connections"
-        _sbuf "SUGGEST: Tune concurrency limits (PHP/Apache/MySQL)"
-    fi
+# --- CPU high, RAM OK → single account or attack
+if [ "${CPU_TOTAL:-0}" -ge 200 ] && [ "$MEM_USED_PCT" -lt 70 ]; then
+    warn "CPU heavily loaded but RAM is normal — likely single account or attack"
+    echo -e "    ${Y}→${N} Run: bash cpu_investigate.sh  to identify the process"
+    echo -e "    ${Y}→${N} Check Section 5 (connection analysis) in: bash firewall_status.sh"
+    ISSUES=$((ISSUES + 1))
+fi
 
-    # RAM high, CPU normal → memory leak or swap abuse
-    if [ "$mem_total" -ge 90 ] && [ "$cpu_total" -lt 100 ]; then
-        log_warn "  → High RAM usage with normal CPU: possible memory leak or misconfigured service"
-        log_warn "    Action: Check MySQL innodb_buffer_pool_size, PHP memory_limit, and swap usage"
-        _sbuf "SUGGEST: Memory config audit (MySQL buffer pool, PHP limits)"
-    fi
+# --- Many PHP CLI processes
+if [ "${PHP_CLI:-0}" -ge 10 ]; then
+    warn "High PHP CLI process count (${PHP_CLI}) — possible spam scripts or scrapers"
+    echo -e "    ${Y}→${N} Run: bash mail_investigate.sh  to check for mail queue issues"
+    echo -e "    ${Y}→${N} Check Section 4 above for long-running PHP CLI by account"
+    ISSUES=$((ISSUES + 1))
+fi
 
-    local mysql_conns
-    mysql_conns=$(mysql -e "SHOW STATUS LIKE 'Threads_connected';" 2>/dev/null | \
-                  awk 'NR==2 {print $2}')
-    local mysql_max
-    mysql_max=$(mysql -e "SHOW VARIABLES LIKE 'max_connections';" 2>/dev/null | \
-                awk 'NR==2 {print $2}')
+# --- MySQL connection pressure
+if [ -n "$CONN_PCT" ] && [ "${CONN_PCT:-0}" -ge 80 ]; then
+    warn "MySQL connections at ${CONN_PCT}% capacity"
+    echo -e "    ${Y}→${N} Tune: max_connections in /etc/my.cnf"
+    echo -e "    ${Y}→${N} Enable: query cache or connection pooling (ProxySQL)"
+    echo -e "    ${Y}→${N} Audit: slow query log for inefficient queries"
+    ISSUES=$((ISSUES + 1))
+fi
 
-    if [ -n "$mysql_conns" ] && [ -n "$mysql_max" ]; then
-        local mysql_pct=$(( (mysql_conns * 100) / mysql_max ))
-        if [ "$mysql_pct" -ge 80 ]; then
-            log_warn "  → MySQL at ${mysql_pct}% connection capacity (${mysql_conns}/${mysql_max})"
-            log_warn "    Action: Enable query caching, audit slow queries, or raise max_connections"
-            _sbuf "SUGGEST: MySQL connection limit tuning ($mysql_pct% used)"
-        fi
-    fi
-
-    echo ""
-    log_ok "Decision helper complete."
-}
+echo ""
+if [ "$ISSUES" -eq 0 ]; then
+    ok "No critical resource issues detected. Server appears healthy."
+fi
 
 # =============================================================================
-# MAIN
+# SECTION 8 — Optimization Quick Reference
 # =============================================================================
-main() {
-    header "RESOURCE AUDIT REPORT"
-    write_log "resource_audit" "Audit started"
+hdr "8. OPTIMIZATION QUICK REFERENCE"
+echo ""
 
-    [ -n "$TARGET_USER" ] && log_info "Account filter: ${TARGET_USER}"
+echo -e "  ${B}LVE / CloudLinux:${N}"
+echo ""
+echo -e "  ${D}# View LVE limits for account:${N}"
+echo    "  lvectl get <username>"
+echo ""
+echo -e "  ${D}# Throttle CPU for abusive account:${N}"
+echo    "  lvectl set <username> --speed=50% --ncpu=1"
+echo ""
+echo -e "  ${D}# Set memory limit:${N}"
+echo    "  lvectl set <username> --vmem=512M"
+echo ""
+echo -e "  ${D}# Reset to default limits:${N}"
+echo    "  lvectl delete <username>"
+echo ""
+echo -e "  ${D}# View LVE usage history (last 24h):${N}"
+echo    "  lveinfo --period=24h --by-cpu --limit=20"
+echo ""
+echo -e "  ${B}MySQL Optimization:${N}"
+echo ""
+echo -e "  ${D}# Live active queries:${N}"
+echo    "  mysql -e 'SHOW FULL PROCESSLIST\G' | grep -B5 'Time: [0-9][0-9]'"
+echo ""
+echo -e "  ${D}# Kill a slow query:${N}"
+echo    "  mysql -e 'KILL QUERY <process_id>;'"
+echo ""
+echo -e "  ${D}# Check slow query log:${N}"
+echo    "  tail -100 /var/lib/mysql/*-slow.log"
+echo ""
+echo -e "  ${D}# InnoDB buffer pool size (should be 70-80% of RAM):${N}"
+echo    "  mysql -e \"SHOW VARIABLES LIKE 'innodb_buffer_pool_size';\""
+echo ""
+echo -e "  ${B}PHP Worker Tuning:${N}"
+echo ""
+echo -e "  ${D}# Restart PHP-FPM for a version:${N}"
+echo    "  service ea-php82-php-fpm restart"
+echo ""
+echo -e "  ${D}# lsphp workers by account (live):${N}"
+echo    "  ps aux | grep lsphp | grep -v grep | awk '{print \$1}' | sort | uniq -c | sort -rn"
+echo ""
+echo -e "  ${D}# Kill all lsphp for one account:${N}"
+echo    "  pkill -u <username> lsphp"
+echo ""
+echo -e "  ${B}Account Management:${N}"
+echo ""
+echo -e "  ${D}# Suspend via WHM CLI:${N}"
+echo    "  whmapi1 suspendacct user=<username> reason='Resource abuse'"
+echo ""
+echo -e "  ${D}# Unsuspend:${N}"
+echo    "  whmapi1 unsuspendacct user=<username>"
+echo ""
+echo -e "  ${D}# Get account resource usage summary:${N}"
+echo    "  whmapi1 accountsummary user=<username>"
+echo ""
 
-    section_combined_resource_score
-    section_mysql_audit
-    section_php_fpm_audit
-    section_decision_helper
-
-    echo ""
-    section "AUDIT COMPLETE"
-    log_info "Log saved to: ${LOG_DIR}/resource_audit.log"
-    write_log "resource_audit" "Audit complete"
-
-    if [ "$POST_SLACK" = true ]; then
-        slack_post "Resource Audit Report" "$SLACK_BUFFER"
-        log_info "Findings posted to Slack."
-    else
-        log_dim "Tip: run with --slack to post findings to Slack"
-    fi
-}
-
-main "$@"
+sep
+echo -e "${G}${B}  Done — $(date '+%H:%M:%S')${N}"
+sep
+echo ""
