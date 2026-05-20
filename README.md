@@ -31,8 +31,7 @@ bash cpu_investigate.sh
 | `disk_investigate.sh` | Disk space alert | Which account/files + dry-run cleanup report |
 | `mail_investigate.sh` | Mail queue alert | Spam source, PHP script, SMTP abuse, blacklist check |
 | `firewall_status.sh` | Firewall alert | CSF/Imunify360 health, attack patterns, connection floods |
-
-> `resource_audit.sh` — Full resource pressure audit (coming soon)
+| `resource_audit.sh` | Memory/load alert | Service health (Nginx/Apache/MySQL) + resource pressure + MySQL + PHP + decision helper |
 
 ---
 
@@ -41,7 +40,8 @@ bash cpu_investigate.sh
 - Linux (RHEL/CentOS/Rocky or Ubuntu/Debian)
 - cPanel/WHM environment
 - Run as **root**
-- No additional packages required — uses standard system tools only (`ps`, `awk`, `grep`, `ss`, `df`, `exim`, `csf`, `imunify360-agent`)
+- No additional packages required — uses standard system tools only
+  (`ps`, `awk`, `grep`, `ss`, `df`, `bc`, `exim`, `csf`, `imunify360-agent`, `mysql`)
 
 ---
 
@@ -57,9 +57,9 @@ chmod +x /opt/hostmon/*.sh
 ### Option 2 — wget single script
 
 ```bash
-wget -O /opt/hostmon/cpu_investigate.sh \
+wget -O cpu_investigate.sh \
     https://raw.githubusercontent.com/YOURORG/hostmon/main/cpu_investigate.sh
-chmod +x /opt/hostmon/cpu_investigate.sh
+chmod +x cpu_investigate.sh
 ```
 
 ### Option 3 — Deploy to all servers via Ansible
@@ -150,14 +150,14 @@ bash disk_investigate.sh --top 20         # Show more accounts (default: 10)
 Run after a mail queue alert to identify and stop spam.
 
 ```bash
-bash mail_investigate.sh                              # Full report
-bash mail_investigate.sh --user johndoe              # Focus on account
-bash mail_investigate.sh --user johndoe --action report   # Show their queue
-bash mail_investigate.sh --user johndoe --action freeze   # Stop their mail
-bash mail_investigate.sh --user johndoe --action unfreeze # Resume delivery
-bash mail_investigate.sh --user johndoe --action remove   # Purge their queue ⚠
-bash mail_investigate.sh --user johndoe --action block    # Block options menu
-bash mail_investigate.sh --user johndoe --action suspend  # Suspend account
+bash mail_investigate.sh                                       # Full report
+bash mail_investigate.sh --user johndoe                       # Focus on account
+bash mail_investigate.sh --user johndoe --action report       # Show their queue
+bash mail_investigate.sh --user johndoe --action freeze       # Stop their mail
+bash mail_investigate.sh --user johndoe --action unfreeze     # Resume delivery
+bash mail_investigate.sh --user johndoe --action remove       # Purge their queue ⚠
+bash mail_investigate.sh --user johndoe --action block        # Block options menu
+bash mail_investigate.sh --user johndoe --action suspend      # Suspend account
 ```
 
 **What it shows:**
@@ -188,12 +188,12 @@ bash firewall_status.sh --unblock 1.2.3.4  # Unblock from CSF + Imunify360
 **What it shows:**
 
 **CSF Health:**
-- Running state, testing mode check, LFD daemon status
+- Running state, testing mode check, LFD daemon status + uptime
 - Permanent deny count, whitelist count, temp block count
-- Key security settings from `csf.conf` with risky values highlighted
+- Key security settings from `csf.conf` with risky values highlighted in red/yellow
 
 **LFD Log Analysis:**
-- Top attacking IPs with pattern detection
+- Top attacking IPs (private IPs filtered out) with pattern detection
 - Services being targeted (SSH, FTP, SMTP, POP3, IMAP, WHM, wp-login, xmlrpc)
 - Port scan detections
 - Resource/process abuse triggers
@@ -203,10 +203,9 @@ bash firewall_status.sh --unblock 1.2.3.4  # Unblock from CSF + Imunify360
 
 **Imunify360:**
 - Service running state
-- Feature status (WAF, Proactive Defense, Malware Scanner) with disabled features highlighted
+- Feature status (WAF, Proactive Defense, Malware Scanner) — disabled features highlighted
 - Recent incidents list
 - Recent malware detections from log
-- Blacklisted IPs sample
 - Proactive Defense mode
 
 **iptables:**
@@ -216,9 +215,88 @@ bash firewall_status.sh --unblock 1.2.3.4  # Unblock from CSF + Imunify360
 
 **Connection Analysis:**
 - Total / Established / SYN_RECV / TIME_WAIT / CLOSE_WAIT
-- SYN flood detection with mitigation steps
-- Top source IPs by connection count
-- Busiest destination ports with service names
+- SYN flood detection with immediate mitigation steps
+- Top source IPs by connection count with flood flag
+- Busiest destination ports with service names (SSH, HTTP, SMTP, WHM, MySQL, etc.)
+
+---
+
+### resource_audit.sh
+
+Run after a memory or sustained load alert for a full resource picture.
+Also useful as a general daily health snapshot.
+
+```bash
+bash resource_audit.sh                   # Full audit
+bash resource_audit.sh --user johndoe   # Deep-dive on one account
+bash resource_audit.sh --top 20         # Show more accounts (default: 15)
+```
+
+**What it shows:**
+
+**Section 0 — Critical Service Health Check (runs first):**
+- Checks Nginx, Apache/LiteSpeed, and MySQL/MariaDB are actually running
+- Shows PID, uptime, memory usage (MB), CPU%, and worker count per service
+- Nginx: live connection stats (active / writing / waiting) from `stub_status`
+- Apache/LiteSpeed: busy vs idle workers from `server-status` with saturation warning
+- MySQL: connection count vs max_connections with threshold warnings
+- Summary line: all-green OK or specific service alerts
+- Uses 6 detection methods for MySQL (pgrep, pgrep -f, systemctl, socket file) — reliably detects MariaDB regardless of process name
+
+**Section 1 — Resource Pressure Score:**
+- Combined score per cPanel account: `CPU% + (RAM% × 0.5)`
+- Verdict per account: Normal / Elevated / HIGH / CRITICAL
+- Identifies the single highest-pressure account automatically
+- Quick deep-dive command suggestion for top offender
+
+**Section 2 — RAM Breakdown:**
+- Total RAM and swap usage with color-coded thresholds
+- OOM kill risk warning when RAM > 95%
+- Top processes by actual RSS memory in MB
+- Top cPanel accounts by total RAM consumption with approximate MB
+
+**Section 3 — MySQL Resource Audit:**
+- MySQL process CPU and RAM percentage
+- Key global status metrics with flagged anomalies (slow queries, lock waits)
+- Connection capacity usage (threads used vs max_connections) with warning at 70%+
+- InnoDB buffer pool hit ratio — warns if below 95%
+- Active queries running > 5 seconds
+- Connections per cPanel account (mapped via DB user prefix)
+- Top databases by size in MB
+
+**Section 4 — PHP Workers:**
+- Worker count by type: lsphp (LiteSpeed), PHP-FPM per version, PHP-CGI, PHP-CLI
+- lsphp workers grouped by cPanel account with top script shown
+- Long-running PHP CLI processes (>2 min) flagged as potential spam/abuse
+- PHP-FPM pool status via socket (active/idle workers, max children reached)
+
+**Section 5 — CloudLinux LVE:**
+- Historical top CPU and memory consumers via `lveinfo`
+- Live per-account LVE snapshot via `lveps` or `/var/lve/info`
+- Accounts hitting LVE fault limits
+
+**Section 6 — Web Server Slots:**
+- LiteSpeed or Apache worker count, CPU%, RAM%
+- Apache `server-status` busy/idle workers
+- Worker count per cPanel account
+
+**Section 7 — Decision Helper:**
+- Pattern-based diagnosis across 7 scenarios:
+  - Single account abuse → throttle via LVE or suspend
+  - Load 3x+ core count → severe overload, immediate action
+  - RAM > 95% → OOM kill risk, upgrade or migrate
+  - High swap usage → RAM-constrained, upgrade needed
+  - Both CPU and RAM high → server at capacity, plan migration
+  - CPU high with normal RAM → single account or attack
+  - High PHP CLI count → spam scripts, check mail queue
+- All recommendations include the exact commands to run
+
+**Section 8 — Optimization Quick Reference:**
+- LVE throttle and limit commands
+- MySQL kill query, slow log check, buffer pool tuning
+- PHP-FPM restart per version
+- lsphp kill per account
+- Account suspend/unsuspend via WHM CLI
 
 ---
 
@@ -250,13 +328,28 @@ All scripts use a consistent color-coded terminal output:
 /opt/hostmon/
 ├── cpu_investigate.sh      # CPU spike investigation
 ├── disk_investigate.sh     # Disk space investigation
-├── mail_investigate.sh     # Mail queue investigation
-├── firewall_status.sh      # Firewall health and attack analysis
-├── resource_audit.sh       # Full resource audit (coming soon)
+├── mail_investigate.sh     # Mail queue & spam investigation
+├── firewall_status.sh      # CSF + Imunify360 health & attack analysis
+├── resource_audit.sh       # Full resource audit + decision helper
 └── README.md
 ```
 
 > Each script is fully self-contained. No shared libraries, no config files required.
+
+---
+
+## MySQL Setup (for resource_audit.sh and disk_investigate.sh)
+
+Both scripts connect to MySQL for database stats. Create `/root/.my.cnf` on each server:
+
+```bash
+cat > /root/.my.cnf << 'EOF'
+[client]
+user=root
+password=YOUR_MYSQL_ROOT_PASSWORD
+EOF
+chmod 600 /root/.my.cnf
+```
 
 ---
 
@@ -294,9 +387,13 @@ cd /opt/hostmon && git pull
 
 ## Roadmap
 
-- [ ] `resource_audit.sh` — Combined CPU/RAM pressure score per account + MySQL + PHP-FPM audit + decision helper (upgrade vs optimize vs abuse)
+- [x] `cpu_investigate.sh` — CPU investigation with LVE + abuse detection
+- [x] `disk_investigate.sh` — Disk investigation with dry-run cleanup
+- [x] `mail_investigate.sh` — Mail queue + spam investigation + DNSBL check
+- [x] `firewall_status.sh` — CSF + Imunify360 health + attack analysis
+- [x] `resource_audit.sh` — Service health check (Nginx/Apache/MySQL) + full resource audit + decision helper
 - [ ] Slack posting flag (`--slack`) across all scripts
-- [ ] Ansible role for full deployment
+- [ ] Ansible role for streamlined deployment
 - [ ] Slack slash command wrapper for remote triggering without SSH
 
 ---

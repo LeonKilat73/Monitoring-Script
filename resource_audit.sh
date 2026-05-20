@@ -63,6 +63,256 @@ echo -e "${D}  RAM: ${MEM_USED_MB}MB / ${MEM_TOTAL_MB}MB used (${MEM_USED_PCT}%)
 [ -n "$TARGET_USER" ] && echo -e "${D}  Account filter: ${TARGET_USER}${N}"
 echo -e "${B}╚══════════════════════════════════════════════════════════════╝${N}"
 
+
+# =============================================================================
+# SERVICE HEALTH CHECK — Nginx, Apache/LiteSpeed, MySQL
+# =============================================================================
+hdr "0. CRITICAL SERVICE HEALTH CHECK"
+echo ""
+
+# Helper: get process uptime from PID
+_proc_uptime() {
+    local pid="$1"
+    local result="unknown"
+    if [ -f "/proc/${pid}/stat" ]; then
+        local start uptime_s hz age
+        start=$(awk '{print $22}' /proc/${pid}/stat 2>/dev/null)
+        uptime_s=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+        hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+        if [ -n "$start" ] && [ -n "$uptime_s" ] && [ "$hz" -gt 0 ]; then
+            age=$(( uptime_s - start/hz ))
+            if   [ "$age" -ge 86400 ]; then result="$(( age/86400 ))d $(( (age%86400)/3600 ))h"
+            elif [ "$age" -ge 3600  ]; then result="$(( age/3600 ))h$(( (age%3600)/60 ))m"
+            elif [ "$age" -ge 60    ]; then result="$(( age/60 ))m$(( age%60 ))s"
+            else result="${age}s"
+            fi
+        fi
+    fi
+    echo "$result"
+}
+
+# Helper: get memory usage of a process group in MB
+_proc_mem_mb() {
+    local pattern="$1"
+    ps aux | grep -E "$pattern" | grep -v grep | \
+        awk '{sum+=$6} END {printf "%.0f", sum/1024}'
+}
+
+printf "  ${B}%-20s %-12s %-10s %-10s %-10s %-s${N}\n" \
+    "SERVICE" "STATUS" "PID" "UPTIME" "MEM(MB)" "EXTRA"
+echo "  ──────────────────────────────────────────────────────────────────────"
+
+# ---- Nginx ----
+NGINX_PID=$(pgrep -f "nginx: master" 2>/dev/null | head -1)
+if [ -z "$NGINX_PID" ]; then
+    NGINX_PID=$(pgrep -x nginx 2>/dev/null | head -1)
+fi
+
+if [ -n "$NGINX_PID" ]; then
+    NGINX_UPTIME=$(_proc_uptime "$NGINX_PID")
+    NGINX_MEM=$(_proc_mem_mb "nginx")
+    NGINX_WORKERS=$(pgrep -c -f "nginx: worker" 2>/dev/null || pgrep -c nginx 2>/dev/null || echo "?")
+    NGINX_CPU=$(ps aux | grep nginx | grep -v grep | \
+                awk '{sum+=$3} END {printf "%.1f", sum+0}')
+    printf "  ${G}%-20s %-12s %-10s %-10s %-10s %-s${N}\n" \
+        "Nginx" "RUNNING" "$NGINX_PID" "$NGINX_UPTIME" "${NGINX_MEM}MB" \
+        "workers: ${NGINX_WORKERS}  cpu: ${NGINX_CPU}%"
+
+    # Nginx stub_status
+    NGINX_ACTIVE=""
+    for NURL in "http://127.0.0.1/nginx_status" \
+                "http://127.0.0.1:8080/nginx_status" \
+                "http://127.0.0.1/status"; do
+        NSTATUS=$(curl -sk --max-time 2 "$NURL" 2>/dev/null)
+        if [ -n "$NSTATUS" ]; then
+            NGINX_ACTIVE=$(echo "$NSTATUS" | grep "Active" | awk '{print $3}')
+            NGINX_WRITING=$(echo "$NSTATUS" | grep "Writing" | awk '{print $4}')
+            NGINX_WAITING=$(echo "$NSTATUS" | grep "Waiting" | awk '{print $6}')
+            break
+        fi
+    done
+
+    if [ -n "$NGINX_ACTIVE" ]; then
+        NGINX_CLR=$G
+        [ "${NGINX_ACTIVE:-0}" -ge 200 ] && NGINX_CLR=$Y
+        [ "${NGINX_ACTIVE:-0}" -ge 500 ] && NGINX_CLR=$R
+        printf "  ${D}%-20s${N} active: ${NGINX_CLR}%s${N}  writing: %s  waiting: %s\n" \
+            "  └─ connections" \
+            "${NGINX_ACTIVE}" "${NGINX_WRITING:-?}" "${NGINX_WAITING:-?}"
+        [ "${NGINX_ACTIVE:-0}" -ge 500 ] && \
+            crit "  Nginx connections critically high (${NGINX_ACTIVE}) — possible flood"
+        [ "${NGINX_ACTIVE:-0}" -ge 200 ] && [ "${NGINX_ACTIVE:-0}" -lt 500 ] && \
+            warn "  Nginx connections elevated (${NGINX_ACTIVE}) — monitor"
+    else
+        printf "  ${D}%-20s${N} stub_status not enabled\n" "  └─ connections"
+    fi
+else
+    printf "  ${Y}%-20s %-12s${N}\n" "Nginx" "NOT RUNNING"
+    warn "  Nginx is not running — if used as proxy, requests go direct to Apache"
+    info "  Start: systemctl start nginx"
+fi
+
+# ---- Apache / LiteSpeed ----
+echo ""
+HTTPD_NAME=""; HTTPD_PID=""
+if   pgrep -x lshttpd &>/dev/null; then
+    HTTPD_NAME="LiteSpeed"; HTTPD_PID=$(pgrep -x lshttpd | head -1)
+elif pgrep -x httpd   &>/dev/null; then
+    HTTPD_NAME="Apache (httpd)"; HTTPD_PID=$(pgrep -x httpd | head -1)
+elif pgrep -x apache2 &>/dev/null; then
+    HTTPD_NAME="Apache (apache2)"; HTTPD_PID=$(pgrep -x apache2 | head -1)
+fi
+
+if [ -n "$HTTPD_PID" ]; then
+    HTTPD_UPTIME=$(_proc_uptime "$HTTPD_PID")
+    HTTPD_BIN=$([ "$HTTPD_NAME" = "LiteSpeed" ] && echo "lshttpd" || \
+                (pgrep -x httpd &>/dev/null && echo "httpd" || echo "apache2"))
+    HTTPD_WORKERS=$(pgrep -c "$HTTPD_BIN" 2>/dev/null || echo "?")
+    HTTPD_MEM=$(_proc_mem_mb "$HTTPD_BIN")
+    HTTPD_CPU=$(ps aux | grep "$HTTPD_BIN" | grep -v grep | \
+                awk '{sum+=$3} END {printf "%.1f", sum+0}')
+
+    printf "  ${G}%-20s %-12s %-10s %-10s %-10s %-s${N}\n" \
+        "$HTTPD_NAME" "RUNNING" "$HTTPD_PID" "$HTTPD_UPTIME" "${HTTPD_MEM}MB" \
+        "workers: ${HTTPD_WORKERS}  cpu: ${HTTPD_CPU}%"
+
+    # Apache server-status summary
+    ASTATUS=$(curl -sk --max-time 3 "http://127.0.0.1/server-status?auto" 2>/dev/null)
+    if [ -n "$ASTATUS" ]; then
+        BUSY=$(echo "$ASTATUS" | grep -i "BusyWorkers" | awk '{print $2}')
+        IDLE=$(echo "$ASTATUS" | grep -i "IdleWorkers" | awk '{print $2}')
+        RPS=$(echo  "$ASTATUS" | grep -i "ReqPerSec"   | awk '{print $2}')
+        TOTAL_W=$(( ${BUSY:-0} + ${IDLE:-0} ))
+        BUSY_CLR=$G
+        [ -n "$BUSY" ] && [ "$TOTAL_W" -gt 0 ] && {
+            BUSY_PCT=$(( BUSY * 100 / TOTAL_W ))
+            [ "$BUSY_PCT" -ge 80 ] && BUSY_CLR=$Y
+            [ "$BUSY_PCT" -ge 95 ] && BUSY_CLR=$R
+        }
+        printf "  ${D}%-20s${N} busy: ${BUSY_CLR}%s${N}  idle: %s  req/s: %s\n" \
+            "  └─ server-status" \
+            "${BUSY:-?}" "${IDLE:-?}" "${RPS:-?}"
+        [ "${BUSY_PCT:-0}" -ge 95 ] && \
+            crit "  Apache/LiteSpeed near capacity (${BUSY_PCT}% workers busy)"
+        [ "${BUSY_PCT:-0}" -ge 80 ] && [ "${BUSY_PCT:-0}" -lt 95 ] && \
+            warn "  Apache/LiteSpeed workers heavily loaded (${BUSY_PCT}%)"
+    else
+        printf "  ${D}%-20s${N} server-status not enabled\n" "  └─ server-status"
+    fi
+else
+    printf "  ${R}%-20s %-12s${N}\n" "Apache/LiteSpeed" "NOT RUNNING"
+    crit "  No web server detected — site requests will fail!"
+    info "  Start Apache: systemctl start httpd"
+    info "  Start LiteSpeed: systemctl start lsws"
+fi
+
+# ---- MySQL / MariaDB ----
+echo ""
+MYSQL_RUNNING=false
+MYSQL_PID=""
+MYSQL_NAME=""
+
+# Try multiple detection methods
+for SVC in mysqld mariadbd; do
+    PID=$(pgrep -x "$SVC" 2>/dev/null | head -1)
+    if [ -n "$PID" ]; then
+        MYSQL_RUNNING=true
+        MYSQL_PID="$PID"
+        MYSQL_NAME="$SVC"
+        break
+    fi
+done
+
+# Fallback: pgrep -f for full path matches like /usr/sbin/mysqld
+if [ "$MYSQL_RUNNING" = false ]; then
+    for SVC in mysqld mariadbd; do
+        PID=$(pgrep -f "$SVC" 2>/dev/null | head -1)
+        if [ -n "$PID" ]; then
+            MYSQL_RUNNING=true
+            MYSQL_PID="$PID"
+            MYSQL_NAME="$SVC (via path)"
+            break
+        fi
+    done
+fi
+
+# Fallback: systemctl
+if [ "$MYSQL_RUNNING" = false ]; then
+    for SVC in mysqld mariadb mysql; do
+        if systemctl is-active "$SVC" &>/dev/null; then
+            MYSQL_RUNNING=true
+            MYSQL_NAME="$SVC (systemctl)"
+            MYSQL_PID=$(systemctl show -p MainPID "$SVC" 2>/dev/null | cut -d= -f2)
+            break
+        fi
+    done
+fi
+
+# Fallback: socket file
+if [ "$MYSQL_RUNNING" = false ]; then
+    for SOCK in /var/lib/mysql/mysql.sock /tmp/mysql.sock /run/mysqld/mysqld.sock; do
+        if [ -S "$SOCK" ]; then
+            MYSQL_RUNNING=true
+            MYSQL_NAME="MySQL (socket found)"
+            break
+        fi
+    done
+fi
+
+if [ "$MYSQL_RUNNING" = true ]; then
+    MYSQL_UPTIME=$(_proc_uptime "${MYSQL_PID:-0}")
+    MYSQL_MEM=$(_proc_mem_mb "mysqld|mariadbd")
+    MYSQL_CPU=$(ps aux | grep -E 'mysqld|mariadbd' | grep -v grep | \
+                awk '{sum+=$3} END {printf "%.1f", sum+0}')
+    MYSQL_CLR=$G
+    [ "$(echo "${MYSQL_CPU:-0} >= 40" | bc -l 2>/dev/null)" = "1" ] && MYSQL_CLR=$Y
+    [ "$(echo "${MYSQL_CPU:-0} >= 80" | bc -l 2>/dev/null)" = "1" ] && MYSQL_CLR=$R
+
+    printf "  ${G}%-20s %-12s %-10s %-10s %-10s %-s${N}\n" \
+        "${MYSQL_NAME}" "RUNNING" "${MYSQL_PID:-—}" \
+        "${MYSQL_UPTIME}" "${MYSQL_MEM}MB" \
+        "cpu: ${MYSQL_CLR}${MYSQL_CPU}%${N}"
+
+    # Connection stats if we can connect
+    if mysql -e "SELECT 1;" &>/dev/null 2>&1; then
+        THREADS=$(mysql -e "SHOW STATUS LIKE 'Threads_connected';" 2>/dev/null | \
+                  awk 'NR==2{print $2}')
+        MAX_CONN=$(mysql -e "SHOW VARIABLES LIKE 'max_connections';" 2>/dev/null | \
+                   awk 'NR==2{print $2}')
+        RUNNING_T=$(mysql -e "SHOW STATUS LIKE 'Threads_running';" 2>/dev/null | \
+                    awk 'NR==2{print $2}')
+        SLOW_Q=$(mysql -e "SHOW STATUS LIKE 'Slow_queries';" 2>/dev/null | \
+                 awk 'NR==2{print $2}')
+        CONN_CLR=$G
+        if [ -n "$THREADS" ] && [ -n "$MAX_CONN" ] && [ "$MAX_CONN" -gt 0 ]; then
+            CONN_PCT=$(( THREADS * 100 / MAX_CONN ))
+            [ "$CONN_PCT" -ge 70 ] && CONN_CLR=$Y
+            [ "$CONN_PCT" -ge 90 ] && CONN_CLR=$R
+            printf "  ${D}%-20s${N} conn: ${CONN_CLR}%s/%s${N}  running: %s  slow_q: %s\n" \
+                "  └─ status" \
+                "$THREADS" "$MAX_CONN" "${RUNNING_T:-?}" "${SLOW_Q:-?}"
+            [ "$CONN_PCT" -ge 90 ] && \
+                crit "  MySQL connections at ${CONN_PCT}% — risk of 'Too many connections'"
+            [ "$CONN_PCT" -ge 70 ] && [ "$CONN_PCT" -lt 90 ] && \
+                warn "  MySQL connections at ${CONN_PCT}% capacity"
+        fi
+    else
+        printf "  ${D}%-20s${N} /root/.my.cnf not set — cannot query stats\n" "  └─ status"
+    fi
+else
+    printf "  ${R}%-20s %-12s${N}\n" "MySQL/MariaDB" "NOT RUNNING"
+    crit "  MySQL/MariaDB is not running — all database-driven sites will fail!"
+    info "  Start: systemctl start mysqld  or  systemctl start mariadb"
+fi
+
+# ---- Summary line ----
+echo ""
+ALL_OK=true
+[ -z "$NGINX_PID" ]   && warn "Nginx: not running"    && ALL_OK=false
+[ -z "$HTTPD_PID" ]   && crit "Web server: not running" && ALL_OK=false
+[ "$MYSQL_RUNNING" = false ] && crit "MySQL: not running" && ALL_OK=false
+[ "$ALL_OK" = true ]  && ok "All critical services are running."
+
 # =============================================================================
 # SECTION 1 — Resource Pressure Score per cPanel Account
 # Score = CPU% + (MEM% × 0.5)
@@ -214,8 +464,19 @@ done
 hdr "3. MYSQL RESOURCE AUDIT"
 echo ""
 
-if ! pgrep -xE "mysqld|mariadbd" &>/dev/null; then
-    warn "MySQL/MariaDB is not running."
+# Detect MySQL/MariaDB using multiple reliable methods
+# pgrep -x alone misses full paths like /usr/sbin/mysqld on cPanel servers
+MYSQL_RUNNING=false
+pgrep -fE "mysqld|mariadbd"      &>/dev/null && MYSQL_RUNNING=true
+systemctl is-active mysqld       &>/dev/null && MYSQL_RUNNING=true
+systemctl is-active mariadb      &>/dev/null && MYSQL_RUNNING=true
+systemctl is-active mysql        &>/dev/null && MYSQL_RUNNING=true
+[ -S /var/lib/mysql/mysql.sock ] && MYSQL_RUNNING=true
+[ -S /tmp/mysql.sock ]           && MYSQL_RUNNING=true
+
+if [ "$MYSQL_RUNNING" = false ]; then
+    warn "MySQL/MariaDB does not appear to be running."
+    info "Check: systemctl status mysqld  or  systemctl status mariadb"
 elif ! mysql -e "SELECT 1;" &>/dev/null 2>&1; then
     warn "Cannot connect to MySQL. Create /root/.my.cnf:"
     echo ""
