@@ -322,242 +322,67 @@ else
     echo -e "    ${D}</Location>${N}"
 fi
 
-# --- Apache full status — properly parsed worker table
+# --- Apache full status — uses standalone parser lib_apache_parser.py
 echo ""
-info "Apache full status — worker table (Srv | PID | Acc | M | CPU | SS | Req | Dur | Conn | Child | Slot | Client | Proto | VHost):"
+info "Apache full status — workers, clients, VHosts, culprit analysis:"
 echo ""
 
-ASTATUS_FULL=$(curl -sk --max-time 4 "http://127.0.0.1/server-status" 2>/dev/null)
-if [ -n "$ASTATUS_FULL" ]; then
+# Gather data from all available sources
+# Source 1: apachectl fullstatus (plain text via lynx — most complete)
+APACHECTL_OUT=""
+if command -v apachectl &>/dev/null; then
+    if command -v lynx &>/dev/null || command -v elinks &>/dev/null; then
+        APACHECTL_OUT=$(TERM=vt100 apachectl fullstatus 2>/dev/null)
+    fi
+fi
 
-    # Use Python to properly parse Apache server-status HTML
-    # Handles BOTH the <table> format AND the packed <pre> scoreboard format
-    # (cPanel servers often return the packed pre format where columns are merged)
-    PARSED=$(echo "$ASTATUS_FULL" | python3 - << 'PYPARSE'
-import sys, re
+# Source 2: curl /server-status HTML
+ASTATUS_HTML=$(curl -sk --max-time 5 "http://127.0.0.1/server-status" 2>/dev/null)
 
-html = sys.stdin.read()
+# Source 3: curl /server-status?auto plain text summary
+ASTATUS_AUTO=$(curl -sk --max-time 5 "http://127.0.0.1/server-status?auto" 2>/dev/null)
 
-MODE_MAP = {
-    '_': 'Waiting',   'S': 'Starting',      'R': 'Reading',
-    'W': 'Writing',   'K': 'Keepalive',     'D': 'DNS lookup',
-    'C': 'Closing',   'L': 'Logging',       'G': 'Graceful finish',
-    'I': 'Idle cleanup', '.': 'Open slot',
-}
-
-MODE_WARN = {'W', 'D', 'G'}
-FLOOD_THRESHOLD = 5
-
-def strip_tags(s):
-    return re.sub(r'<[^>]+>', '', s).strip()
-
-# ── STRATEGY 1: Parse the HTML <table> (full server-status with ExtendedStatus On)
-# Apache renders a table with columns: Srv PID Acc M CPU SS Req Dur Conn Child Slot Client Protocol VHost [Request]
-def parse_table(html):
-    workers = []
-    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
-    for row in rows:
-        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
-        cells = [strip_tags(c) for c in cells]
-        if len(cells) >= 13:
-            # First cell must look like a worker slot: 0-0 or 0
-            if re.match(r'^\d+[-]\d+$', cells[0]) or re.match(r'^\d+$', cells[0]):
-                workers.append(cells)
-    return workers
-
-# ── STRATEGY 2: Parse the packed <pre> scoreboard lines
-# cPanel Apache often outputs this format (no spaces between fields):
-#   CHILD-PID ACC/CHILD/SLOT MODE
-# Example:  0-8024046861/72/5919W
-# Breakdown: child=0  pid=80240  acc=4686  child_acc=1/72/5919  mode=W
-# The PID and acc numbers are concatenated — we split by the acc pattern
-def parse_pre_lines(html):
-    workers = []
-    # Remove HTML tags to get raw text lines
-    raw = re.sub(r'<[^>]+>', '', html)
-    # Pattern: one or more digits (child-pid block) + digits/digits/digits + single mode char
-    # The key insight: the line always ends with digits/digits/digits + MODE_CHAR
-    line_pat = re.compile(
-        r'^(\d+)'           # child number
-        r'-'
-        r'(\d+)'            # pid (may be long)
-        r'(\d+/\d+/\d+)'   # acc/child_acc/slot_acc  (no separator from pid)
-        r'([_SRWKDCLGI.])$' # mode character
-    )
-    for line in raw.splitlines():
-        line = line.strip()
-        m = line_pat.match(line)
-        if m:
-            child = m.group(1)
-            pid   = m.group(2)
-            acc   = m.group(3)
-            mode  = m.group(4)
-            # acc is cur/child/slot but packed into pid — split correctly
-            # The pid digits + leading acc digit(s) are merged, we trust the / separators
-            workers.append({
-                'srv':    child,
-                'pid':    pid,
-                'acc':    acc,
-                'mode':   mode,
-                'cpu':    '—',
-                'ss':     '—',
-                'req':    '—',
-                'conn':   '—',
-                'client': '—',
-                'proto':  '—',
-                'vhost':  '—',
-                'request':'—',
-            })
-    return workers
-
-# ── STRATEGY 3: Scoreboard string summary (least info, always available)
-def parse_scoreboard(html):
-    pre = re.search(r'<pre[^>]*>(.*?)</pre>', html, re.DOTALL | re.IGNORECASE)
-    if not pre:
-        return {}
-    board = strip_tags(pre.group(1)).replace('\n','').replace(' ','')
-    counts = {}
-    for ch in board:
-        if ch in MODE_MAP:
-            counts[ch] = counts.get(ch, 0) + 1
-    return counts
-
-# ── Try strategies in order ──────────────────────────────────────────────────
-table_workers = parse_table(html)
-pre_workers   = parse_pre_lines(html)
-
-R   = "\033[0;31m"
-Y   = "\033[1;33m"
-G   = "\033[0;32m"
-DIM = "\033[2m"
-B   = "\033[1m"
-RST = "\033[0m"
-
-def mode_color(m):
-    if m == 'W': return Y
-    if m == 'D': return R
-    if m in ('G','C'): return DIM
-    if m == '_': return DIM
-    return ''
-
-if table_workers:
-    # ── Full table output ───────────────────────────────────────────────────
-    print(f"\n  {B}{'Srv':<8} {'PID':<8} {'Acc cur/child/slot':<22} {'M':<3} {'CPU':<7} {'SS':<5} {'Req':<5} {'Conn':<7} {'Client':<18} {'Proto':<10} VHost{RST}")
-    print("  " + "─" * 115)
-
-    ACTIVE = 0; DNS_COUNT = 0
-    top_clients = {}; top_vhosts = {}
-
-    for c in table_workers:
-        try:
-            srv    = c[0];  pid  = c[1];  acc   = c[2];  mode = c[3]
-            cpu    = c[4];  ss   = c[5];  req   = c[6];  dur  = c[7]
-            conn   = c[8];  child= c[9];  slot  = c[10]
-            client = c[11] if len(c) > 11 else '—'
-            proto  = c[12] if len(c) > 12 else '—'
-            vhost  = c[13] if len(c) > 13 else '—'
-            vhost  = vhost.split(':')[0]  # strip port
-            request= c[14] if len(c) > 14 else ''
-
-            if mode == 'W': ACTIVE += 1
-            if mode == 'D': DNS_COUNT += 1
-            if client not in ('?','—','0.0.0.0',''):
-                top_clients[client] = top_clients.get(client, 0) + 1
-            if vhost not in ('?','—',''):
-                top_vhosts[vhost] = top_vhosts.get(vhost, 0) + 1
-
-            clr = mode_color(mode)
-            req_short = request[:45] if request else ''
-            print(f"  {clr}{srv:<8} {pid:<8} {acc:<22} {mode:<3} {cpu:<7} {ss:<5} {req:<5} {conn:<7} {client:<18} {proto:<10} {vhost}{RST}")
-            # Show request on same line if it's active (W)
-            if mode == 'W' and req_short:
-                print(f"  {Y}{'':>8} {'':>8} {'':>22}     → {req_short}{RST}")
-
-        except Exception:
-            continue
-
-    print(f"\n  {B}Summary:{RST}")
-    print(f"  Active writing (W) : {Y if ACTIVE > 10 else ''}{ACTIVE}{RST}")
-    if DNS_COUNT > 0:
-        print(f"  DNS lookup (D)     : {R}{DNS_COUNT} — may cause slowdowns if high{RST}")
-    if top_clients:
-        print(f"\n  {B}Top clients:{RST}")
-        for ip, cnt in sorted(top_clients.items(), key=lambda x: -x[1])[:10]:
-            clr = R if cnt >= FLOOD_THRESHOLD else (Y if cnt >= 3 else '')
-            flag = '  ◄ POSSIBLE FLOOD' if cnt >= FLOOD_THRESHOLD else ''
-            print(f"    {clr}{cnt:<5} {ip}{flag}{RST}")
-    if top_vhosts:
-        print(f"\n  {B}Top VHosts being served:{RST}")
-        for vh, cnt in sorted(top_vhosts.items(), key=lambda x: -x[1])[:10]:
-            print(f"    {cnt:<5} {vh}")
-
-elif pre_workers:
-    # ── Packed pre-block output ─────────────────────────────────────────────
-    print(f"\n  {B}{'Child':<8} {'PID':<12} {'Acc cur/child/slot':<22} {'M':<3}  Meaning{RST}")
-    print("  " + "─" * 75)
-    print(f"  {DIM}(ExtendedStatus Off — Client/VHost/CPU columns not available){RST}\n")
-
-    ACTIVE = 0; DNS_COUNT = 0
-    mode_counts = {}
-
-    for w in pre_workers:
-        mode = w['mode']
-        mode_counts[mode] = mode_counts.get(mode, 0) + 1
-        if mode == 'W': ACTIVE += 1
-        if mode == 'D': DNS_COUNT += 1
-        clr  = mode_color(mode)
-        meaning = MODE_MAP.get(mode, '?')
-        print(f"  {clr}{w['srv']:<8} {w['pid']:<12} {w['acc']:<22} {mode:<3}  {meaning}{RST}")
-
-    print(f"\n  {B}Summary:{RST}")
-    for ch, meaning in MODE_MAP.items():
-        cnt = mode_counts.get(ch, 0)
-        if cnt > 0:
-            clr  = mode_color(ch)
-            flag = '  ◄ ACTIVE NOW'    if ch == 'W' else ''
-            flag = '  ◄ DNS SLOW'      if ch == 'D' and cnt > 5 else flag
-            print(f"    {clr}{ch}  {cnt:<5}  {meaning}{flag}{RST}")
-
-    print(f"\n  {Y}▲ To see Client/VHost/CPU columns, enable ExtendedStatus in Apache:{RST}")
-    print(f"  {DIM}  WHM → Apache Config → Global Config → ExtendedStatus = On{RST}")
-    print(f"  {DIM}  Or add to httpd.conf:  ExtendedStatus On{RST}")
-
-else:
-    # ── Scoreboard only ─────────────────────────────────────────────────────
-    counts = parse_scoreboard(html)
-    if counts:
-        print(f"\n  {B}Scoreboard summary (worker status counts):{RST}")
-        print(f"  {'Mode':<8} {'Count':<8} Meaning")
-        print("  " + "─" * 40)
-        for ch, meaning in MODE_MAP.items():
-            cnt = counts.get(ch, 0)
-            if cnt > 0:
-                clr  = mode_color(ch)
-                flag = '  ◄ DNS slowdown risk' if ch == 'D' and cnt > 5 else ''
-                print(f"  {clr}{ch:<8} {cnt:<8} {meaning}{flag}{RST}")
-    else:
-        print("  Could not parse any worker data from server-status page.")
-
-PYPARSE
-)
-
-    echo "$PARSED"
-
-    # Mode legend
-    echo ""
-    info "Mode (M) column legend:"
-    echo -e "  ${D}_ Waiting(idle)  W Writing(active)  R Reading  K Keepalive${N}"
-    echo -e "  ${D}D DNS lookup(slow if many)  C Closing  G Graceful finish  . Open slot${N}"
-
-else
-    warn "Could not retrieve full Apache status page."
-    info "Enable in WHM → Apache Configuration → Global Configuration → Server Status"
-    info "Or add to httpd.conf:"
+# Check if we have anything at all
+if [ -z "$APACHECTL_OUT" ] && [ -z "$ASTATUS_HTML" ] && [ -z "$ASTATUS_AUTO" ]; then
+    crit "Cannot reach Apache server-status from any source."
+    warn "  apachectl fullstatus: requires lynx — install with: yum install lynx"
+    warn "  curl http://127.0.0.1/server-status: not reachable"
+    info "  Enable in WHM → Apache Configuration → Global Config → Server Status = On"
+    info "  Or add to httpd.conf:"
     echo -e "    ${D}<Location /server-status>${N}"
     echo -e "    ${D}  SetHandler server-status${N}"
     echo -e "    ${D}  Require ip 127.0.0.1${N}"
+    echo -e "    ${D}  ExtendedStatus On${N}"
     echo -e "    ${D}</Location>${N}"
+else
+    # Find the parser — check same dir as this script, then /opt/hostmon
+    PARSER_SCRIPT=""
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    for candidate in \
+        "${SCRIPT_DIR}/lib_apache_parser.py" \
+        "/opt/hostmon/lib_apache_parser.py" \
+        "/usr/local/hostpapa/bin/Monitoring-Script/lib_apache_parser.py"; do
+        [ -f "$candidate" ] && PARSER_SCRIPT="$candidate" && break
+    done
+
+    if [ -z "$PARSER_SCRIPT" ]; then
+        crit "lib_apache_parser.py not found alongside cpu_investigate.sh"
+        info "Place lib_apache_parser.py in the same directory as this script."
+    else
+        # Export vars so Python can read them
+        export APACHECTL_OUT
+        export ASTATUS_HTML
+        export ASTATUS_AUTO
+        python3 "$PARSER_SCRIPT"
+    fi
 fi
+
+# Mode legend always shown
+echo ""
+info "Mode (M) legend: _ Waiting  W Writing  R Reading  K Keepalive"
+info "                 D DNS-lookup  C Closing  G Graceful  . Open-slot"
+echo -e "  ${D}Enable full detail: WHM -> Apache Config -> ExtendedStatus = On${N}"
+
 
 # =============================================================================
 # SECTION 5 — Nginx Status & Per-Account Config
