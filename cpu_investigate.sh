@@ -322,93 +322,268 @@ else
     echo -e "    ${D}</Location>${N}"
 fi
 
-# --- Apache full status — the table you asked for
-# Srv PID Acc M CPU SS Req Dur Conn Child Slot Client Protocol VHost
+# --- Apache full status — properly parsed worker table
 echo ""
-info "Apache full status — active request table (Srv PID Acc M CPU SS Req Dur Conn Child Slot Client Protocol VHost):"
+info "Apache full status — worker table (Srv | PID | Acc | M | CPU | SS | Req | Dur | Conn | Child | Slot | Client | Proto | VHost):"
 echo ""
 
 ASTATUS_FULL=$(curl -sk --max-time 4 "http://127.0.0.1/server-status" 2>/dev/null)
 if [ -n "$ASTATUS_FULL" ]; then
-    # Strip HTML and extract the worker table
-    # Look for lines that contain the slot data pattern
-    CLEAN=$(echo "$ASTATUS_FULL" | sed 's/<[^>]*>//g' | sed '/^$/d')
 
-    # Print header
-    printf "  ${B}%-6s %-8s %-6s %-2s %-6s %-6s %-5s %-8s %-6s %-6s %-6s %-16s %-8s %-s${N}\n" \
-        "Srv" "PID" "Acc" "M" "CPU" "SS" "Req" "Dur" "Conn" "Child" "Slot" "Client" "Proto" "VHost"
-    echo "  ──────────────────────────────────────────────────────────────────────────────────────────────"
+    # Use Python to properly parse Apache server-status HTML
+    # Handles BOTH the <table> format AND the packed <pre> scoreboard format
+    # (cPanel servers often return the packed pre format where columns are merged)
+    PARSED=$(echo "$ASTATUS_FULL" | python3 - << 'PYPARSE'
+import sys, re
 
-    # Extract worker rows — they start with a digit (slot number)
-    # Apache status page format varies — we parse the pre/table section
-    echo "$CLEAN" | grep -E "^[[:space:]]*[0-9]+-[0-9]+" | head -40 | \
-    while IFS= read -r l; do
-        echo "  $l"
-    done
+html = sys.stdin.read()
 
-    # Fallback: if table parsing didn't work, show raw cleaned lines
-    PARSED_COUNT=$(echo "$CLEAN" | grep -cE "^[[:space:]]*[0-9]+-[0-9]+" || echo 0)
-    if [ "${PARSED_COUNT:-0}" -eq 0 ]; then
-        # Try alternative: lines with GET/POST patterns
-        echo "$ASTATUS_FULL" | \
-            grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+[^"]*"(GET|POST|HEAD)[^"]*"' | \
-            head -20 | while IFS= read -r l; do echo "    $l"; done
+MODE_MAP = {
+    '_': 'Waiting',   'S': 'Starting',      'R': 'Reading',
+    'W': 'Writing',   'K': 'Keepalive',     'D': 'DNS lookup',
+    'C': 'Closing',   'L': 'Logging',       'G': 'Graceful finish',
+    'I': 'Idle cleanup', '.': 'Open slot',
+}
 
-        # Show top active URLs being served
-        echo ""
-        info "Top active requests (URL pattern):"
-        echo "$ASTATUS_FULL" | grep -oE '"(GET|POST|HEAD|PUT|DELETE) [^"]*"' | \
-            sort | uniq -c | sort -rn | head -15 | \
-            while read -r cnt req; do printf "    %-6s %s\n" "$cnt" "$req"; done
-    fi
+MODE_WARN = {'W', 'D', 'G'}
+FLOOD_THRESHOLD = 5
 
-    # Top client IPs from full status
+def strip_tags(s):
+    return re.sub(r'<[^>]+>', '', s).strip()
+
+# ── STRATEGY 1: Parse the HTML <table> (full server-status with ExtendedStatus On)
+# Apache renders a table with columns: Srv PID Acc M CPU SS Req Dur Conn Child Slot Client Protocol VHost [Request]
+def parse_table(html):
+    workers = []
+    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
+    for row in rows:
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+        cells = [strip_tags(c) for c in cells]
+        if len(cells) >= 13:
+            # First cell must look like a worker slot: 0-0 or 0
+            if re.match(r'^\d+[-]\d+$', cells[0]) or re.match(r'^\d+$', cells[0]):
+                workers.append(cells)
+    return workers
+
+# ── STRATEGY 2: Parse the packed <pre> scoreboard lines
+# cPanel Apache often outputs this format (no spaces between fields):
+#   CHILD-PID ACC/CHILD/SLOT MODE
+# Example:  0-8024046861/72/5919W
+# Breakdown: child=0  pid=80240  acc=4686  child_acc=1/72/5919  mode=W
+# The PID and acc numbers are concatenated — we split by the acc pattern
+def parse_pre_lines(html):
+    workers = []
+    # Remove HTML tags to get raw text lines
+    raw = re.sub(r'<[^>]+>', '', html)
+    # Pattern: one or more digits (child-pid block) + digits/digits/digits + single mode char
+    # The key insight: the line always ends with digits/digits/digits + MODE_CHAR
+    line_pat = re.compile(
+        r'^(\d+)'           # child number
+        r'-'
+        r'(\d+)'            # pid (may be long)
+        r'(\d+/\d+/\d+)'   # acc/child_acc/slot_acc  (no separator from pid)
+        r'([_SRWKDCLGI.])$' # mode character
+    )
+    for line in raw.splitlines():
+        line = line.strip()
+        m = line_pat.match(line)
+        if m:
+            child = m.group(1)
+            pid   = m.group(2)
+            acc   = m.group(3)
+            mode  = m.group(4)
+            # acc is cur/child/slot but packed into pid — split correctly
+            # The pid digits + leading acc digit(s) are merged, we trust the / separators
+            workers.append({
+                'srv':    child,
+                'pid':    pid,
+                'acc':    acc,
+                'mode':   mode,
+                'cpu':    '—',
+                'ss':     '—',
+                'req':    '—',
+                'conn':   '—',
+                'client': '—',
+                'proto':  '—',
+                'vhost':  '—',
+                'request':'—',
+            })
+    return workers
+
+# ── STRATEGY 3: Scoreboard string summary (least info, always available)
+def parse_scoreboard(html):
+    pre = re.search(r'<pre[^>]*>(.*?)</pre>', html, re.DOTALL | re.IGNORECASE)
+    if not pre:
+        return {}
+    board = strip_tags(pre.group(1)).replace('\n','').replace(' ','')
+    counts = {}
+    for ch in board:
+        if ch in MODE_MAP:
+            counts[ch] = counts.get(ch, 0) + 1
+    return counts
+
+# ── Try strategies in order ──────────────────────────────────────────────────
+table_workers = parse_table(html)
+pre_workers   = parse_pre_lines(html)
+
+R   = "\033[0;31m"
+Y   = "\033[1;33m"
+G   = "\033[0;32m"
+DIM = "\033[2m"
+B   = "\033[1m"
+RST = "\033[0m"
+
+def mode_color(m):
+    if m == 'W': return Y
+    if m == 'D': return R
+    if m in ('G','C'): return DIM
+    if m == '_': return DIM
+    return ''
+
+if table_workers:
+    # ── Full table output ───────────────────────────────────────────────────
+    print(f"\n  {B}{'Srv':<8} {'PID':<8} {'Acc cur/child/slot':<22} {'M':<3} {'CPU':<7} {'SS':<5} {'Req':<5} {'Conn':<7} {'Client':<18} {'Proto':<10} VHost{RST}")
+    print("  " + "─" * 115)
+
+    ACTIVE = 0; DNS_COUNT = 0
+    top_clients = {}; top_vhosts = {}
+
+    for c in table_workers:
+        try:
+            srv    = c[0];  pid  = c[1];  acc   = c[2];  mode = c[3]
+            cpu    = c[4];  ss   = c[5];  req   = c[6];  dur  = c[7]
+            conn   = c[8];  child= c[9];  slot  = c[10]
+            client = c[11] if len(c) > 11 else '—'
+            proto  = c[12] if len(c) > 12 else '—'
+            vhost  = c[13] if len(c) > 13 else '—'
+            vhost  = vhost.split(':')[0]  # strip port
+            request= c[14] if len(c) > 14 else ''
+
+            if mode == 'W': ACTIVE += 1
+            if mode == 'D': DNS_COUNT += 1
+            if client not in ('?','—','0.0.0.0',''):
+                top_clients[client] = top_clients.get(client, 0) + 1
+            if vhost not in ('?','—',''):
+                top_vhosts[vhost] = top_vhosts.get(vhost, 0) + 1
+
+            clr = mode_color(mode)
+            req_short = request[:45] if request else ''
+            print(f"  {clr}{srv:<8} {pid:<8} {acc:<22} {mode:<3} {cpu:<7} {ss:<5} {req:<5} {conn:<7} {client:<18} {proto:<10} {vhost}{RST}")
+            # Show request on same line if it's active (W)
+            if mode == 'W' and req_short:
+                print(f"  {Y}{'':>8} {'':>8} {'':>22}     → {req_short}{RST}")
+
+        except Exception:
+            continue
+
+    print(f"\n  {B}Summary:{RST}")
+    print(f"  Active writing (W) : {Y if ACTIVE > 10 else ''}{ACTIVE}{RST}")
+    if DNS_COUNT > 0:
+        print(f"  DNS lookup (D)     : {R}{DNS_COUNT} — may cause slowdowns if high{RST}")
+    if top_clients:
+        print(f"\n  {B}Top clients:{RST}")
+        for ip, cnt in sorted(top_clients.items(), key=lambda x: -x[1])[:10]:
+            clr = R if cnt >= FLOOD_THRESHOLD else (Y if cnt >= 3 else '')
+            flag = '  ◄ POSSIBLE FLOOD' if cnt >= FLOOD_THRESHOLD else ''
+            print(f"    {clr}{cnt:<5} {ip}{flag}{RST}")
+    if top_vhosts:
+        print(f"\n  {B}Top VHosts being served:{RST}")
+        for vh, cnt in sorted(top_vhosts.items(), key=lambda x: -x[1])[:10]:
+            print(f"    {cnt:<5} {vh}")
+
+elif pre_workers:
+    # ── Packed pre-block output ─────────────────────────────────────────────
+    print(f"\n  {B}{'Child':<8} {'PID':<12} {'Acc cur/child/slot':<22} {'M':<3}  Meaning{RST}")
+    print("  " + "─" * 75)
+    print(f"  {DIM}(ExtendedStatus Off — Client/VHost/CPU columns not available){RST}\n")
+
+    ACTIVE = 0; DNS_COUNT = 0
+    mode_counts = {}
+
+    for w in pre_workers:
+        mode = w['mode']
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        if mode == 'W': ACTIVE += 1
+        if mode == 'D': DNS_COUNT += 1
+        clr  = mode_color(mode)
+        meaning = MODE_MAP.get(mode, '?')
+        print(f"  {clr}{w['srv']:<8} {w['pid']:<12} {w['acc']:<22} {mode:<3}  {meaning}{RST}")
+
+    print(f"\n  {B}Summary:{RST}")
+    for ch, meaning in MODE_MAP.items():
+        cnt = mode_counts.get(ch, 0)
+        if cnt > 0:
+            clr  = mode_color(ch)
+            flag = '  ◄ ACTIVE NOW'    if ch == 'W' else ''
+            flag = '  ◄ DNS SLOW'      if ch == 'D' and cnt > 5 else flag
+            print(f"    {clr}{ch}  {cnt:<5}  {meaning}{flag}{RST}")
+
+    print(f"\n  {Y}▲ To see Client/VHost/CPU columns, enable ExtendedStatus in Apache:{RST}")
+    print(f"  {DIM}  WHM → Apache Config → Global Config → ExtendedStatus = On{RST}")
+    print(f"  {DIM}  Or add to httpd.conf:  ExtendedStatus On{RST}")
+
+else:
+    # ── Scoreboard only ─────────────────────────────────────────────────────
+    counts = parse_scoreboard(html)
+    if counts:
+        print(f"\n  {B}Scoreboard summary (worker status counts):{RST}")
+        print(f"  {'Mode':<8} {'Count':<8} Meaning")
+        print("  " + "─" * 40)
+        for ch, meaning in MODE_MAP.items():
+            cnt = counts.get(ch, 0)
+            if cnt > 0:
+                clr  = mode_color(ch)
+                flag = '  ◄ DNS slowdown risk' if ch == 'D' and cnt > 5 else ''
+                print(f"  {clr}{ch:<8} {cnt:<8} {meaning}{flag}{RST}")
+    else:
+        print("  Could not parse any worker data from server-status page.")
+
+PYPARSE
+)
+
+    echo "$PARSED"
+
+    # Mode legend
     echo ""
-    info "Top client IPs in server-status:"
-    echo "$ASTATUS_FULL" | \
-        grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | \
-        grep -vE '^(127\.|::1)' | \
-        sort | uniq -c | sort -rn | head -10 | \
-        while read -r cnt ip; do
-            CLR=$N; FLAG=""
-            [ "$cnt" -ge 20 ] && CLR=$R && FLAG=" ◄ HIGH — possible flood"
-            [ "$cnt" -ge 10 ] && [ "$cnt" -lt 20 ] && CLR=$Y && FLAG=" ◄ Elevated"
-            printf "${CLR}    %-6s %s%s${N}\n" "$cnt" "$ip" "$FLAG"
-        done
+    info "Mode (M) column legend:"
+    echo -e "  ${D}_ Waiting(idle)  W Writing(active)  R Reading  K Keepalive${N}"
+    echo -e "  ${D}D DNS lookup(slow if many)  C Closing  G Graceful finish  . Open slot${N}"
 
-    # Top VHosts being hit
-    echo ""
-    info "Top VHosts being served right now:"
-    echo "$ASTATUS_FULL" | \
-        grep -oE 'vhost[^<]*|<td>[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | \
-        tr -d '<td>' | grep '\.' | \
-        sort | uniq -c | sort -rn | head -10 | \
-        while read -r cnt vh; do printf "    %-6s %s\n" "$cnt" "$vh"; done
 else
     warn "Could not retrieve full Apache status page."
+    info "Enable in WHM → Apache Configuration → Global Configuration → Server Status"
+    info "Or add to httpd.conf:"
+    echo -e "    ${D}<Location /server-status>${N}"
+    echo -e "    ${D}  SetHandler server-status${N}"
+    echo -e "    ${D}  Require ip 127.0.0.1${N}"
+    echo -e "    ${D}</Location>${N}"
 fi
 
 # =============================================================================
-# SECTION 5 — Nginx Status (as proxy)
+# SECTION 5 — Nginx Status & Per-Account Config
 # =============================================================================
 hdr "5. NGINX STATUS (PROXY LAYER)"
 echo ""
 
 NGINX_RUNNING=false
 pgrep -x nginx &>/dev/null && NGINX_RUNNING=true
-pgrep -f nginx &>/dev/null && NGINX_RUNNING=true
+pgrep -f "nginx:" &>/dev/null && NGINX_RUNNING=true
+systemctl is-active nginx &>/dev/null && NGINX_RUNNING=true
 
 if [ "$NGINX_RUNNING" = false ]; then
-    info "Nginx is not running on this server."
-    info "If you expect Nginx as a proxy, check: systemctl status nginx"
+    warn "Nginx is not running on this server."
+    info "If used as a proxy front-end, start with: systemctl start nginx"
 else
+    # --- Process info
     NGINX_PROCS=$(pgrep -c nginx 2>/dev/null || echo "?")
+    NGINX_WORKERS=$(pgrep -c -f "nginx: worker" 2>/dev/null || echo "?")
+    NGINX_MASTER_C=$(pgrep -c -f "nginx: master" 2>/dev/null || echo "?")
     NGINX_CPU=$(ps aux | grep nginx | grep -v grep | \
                 awk '{sum+=$3} END {printf "%.1f", sum+0}')
     NGINX_MEM=$(ps aux | grep nginx | grep -v grep | \
                 awk '{sum+=$4} END {printf "%.1f", sum+0}')
 
-    # Nginx uptime from master process
+    # Nginx uptime from master PID
     NGINX_MASTER_PID=$(pgrep -f "nginx: master" 2>/dev/null | head -1)
     NGINX_UPTIME="unknown"
     if [ -n "$NGINX_MASTER_PID" ] && [ -f "/proc/${NGINX_MASTER_PID}/stat" ]; then
@@ -418,27 +593,22 @@ else
         if [ -n "$START" ] && [ -n "$UPTIME_S" ] && [ "$HZ" -gt 0 ]; then
             AGE=$(( UPTIME_S - START/HZ ))
             if   [ "$AGE" -ge 86400 ]; then NGINX_UPTIME="$(( AGE/86400 ))d $(( (AGE%86400)/3600 ))h"
-            elif [ "$AGE" -ge 3600 ];  then NGINX_UPTIME="$(( AGE/3600 ))h$(( (AGE%3600)/60 ))m"
-            else                            NGINX_UPTIME="$(( AGE/60 ))m"
+            elif [ "$AGE" -ge 3600  ]; then NGINX_UPTIME="$(( AGE/3600 ))h$(( (AGE%3600)/60 ))m"
+            else                            NGINX_UPTIME="$(( AGE/60 ))m$(( AGE%60 ))s"
             fi
         fi
     fi
 
-    echo -e "  ${B}Nginx processes :${N} ${NGINX_PROCS}"
-    echo -e "  ${B}CPU total       :${N} ${NGINX_CPU}%"
-    echo -e "  ${B}RAM total       :${N} ${NGINX_MEM}%"
-    echo -e "  ${B}Uptime          :${N} ${NGINX_UPTIME}"
+    printf "  ${B}%-28s${N} %s\n" "Status:"           "RUNNING"
+    printf "  ${B}%-28s${N} %s\n" "Master processes:" "$NGINX_MASTER_C"
+    printf "  ${B}%-28s${N} %s\n" "Worker processes:" "$NGINX_WORKERS"
+    printf "  ${B}%-28s${N} %s%%\n" "CPU total:"      "$NGINX_CPU"
+    printf "  ${B}%-28s${N} %s%%\n" "RAM total:"      "$NGINX_MEM"
+    printf "  ${B}%-28s${N} %s\n" "Uptime:"           "$NGINX_UPTIME"
 
-    # Worker vs master breakdown
+    # --- stub_status
     echo ""
-    NGINX_WORKERS=$(pgrep -c -f "nginx: worker" 2>/dev/null || echo "?")
-    NGINX_MASTER=$(pgrep -c -f "nginx: master" 2>/dev/null || echo "?")
-    info "Master processes : ${NGINX_MASTER}"
-    info "Worker processes : ${NGINX_WORKERS}"
-
-    # Nginx stub_status (if enabled)
-    echo ""
-    info "Nginx stub_status:"
+    info "Nginx stub_status (live connection metrics):"
     NGINX_STATUS=""
     for STATUS_URL in \
         "http://127.0.0.1/nginx_status" \
@@ -449,7 +619,7 @@ else
     done
 
     if [ -n "$NGINX_STATUS" ]; then
-        ACTIVE=$(echo "$NGINX_STATUS"  | grep "Active"   | awk '{print $3}')
+        ACTIVE=$(echo  "$NGINX_STATUS" | grep "Active"   | awk '{print $3}')
         READING=$(echo "$NGINX_STATUS" | grep "Reading"  | awk '{print $2}')
         WRITING=$(echo "$NGINX_STATUS" | grep "Writing"  | awk '{print $4}')
         WAITING=$(echo "$NGINX_STATUS" | grep "Waiting"  | awk '{print $6}')
@@ -457,40 +627,43 @@ else
         REQUESTS=$(echo "$NGINX_STATUS"| grep "requests" | awk 'NR==2{print $3}')
 
         echo ""
-        printf "  ${B}%-28s${N} %s\n" "Active connections:"  "${ACTIVE:-?}"
+        ACTIVE_CLR=$G
+        [ "${ACTIVE:-0}" -ge 200 ] && ACTIVE_CLR=$Y
+        [ "${ACTIVE:-0}" -ge 500 ] && ACTIVE_CLR=$R
+        printf "  ${B}%-28s${N} ${ACTIVE_CLR}%s${N}\n" "Active connections:" "${ACTIVE:-?}"
         printf "  ${B}%-28s${N} %s\n" "Reading:"             "${READING:-?}"
         printf "  ${B}%-28s${N} %s\n" "Writing:"             "${WRITING:-?}"
         printf "  ${B}%-28s${N} %s\n" "Waiting (keepalive):" "${WAITING:-?}"
-        printf "  ${B}%-28s${N} %s\n" "Connections handled:" "${HANDLED:-?}"
+        printf "  ${B}%-28s${N} %s\n" "Total connections:"   "${HANDLED:-?}"
         printf "  ${B}%-28s${N} %s\n" "Total requests:"      "${REQUESTS:-?}"
 
-        # Flood detection from Nginx
         echo ""
-        if [ -n "$ACTIVE" ] && [ "${ACTIVE:-0}" -ge 500 ]; then
-            crit "Nginx active connections: ${ACTIVE} — possible flood or traffic spike"
-        elif [ -n "$ACTIVE" ] && [ "${ACTIVE:-0}" -ge 200 ]; then
-            warn "Nginx active connections: ${ACTIVE} — elevated, monitor closely"
+        if   [ "${ACTIVE:-0}" -ge 500 ]; then
+            crit "Active connections CRITICAL (${ACTIVE}) — possible DDoS or flood"
+            echo -e "    ${Y}→${N} Check top IPs in Section 6 and block via CSF"
+            echo -e "    ${Y}→${N} Enable Nginx rate limiting per-account (see Section 7)"
+        elif [ "${ACTIVE:-0}" -ge 200 ]; then
+            warn "Active connections elevated (${ACTIVE}) — monitor closely"
         else
-            ok "Nginx active connections: ${ACTIVE:-?} — normal range"
+            ok "Active connections normal (${ACTIVE:-?})"
         fi
 
-        if [ -n "$WRITING" ] && [ "${WRITING:-0}" -ge 100 ]; then
-            warn "High WRITING count (${WRITING}) — Nginx is actively sending many responses"
-            echo -e "    ${Y}→${N} Possible DDoS or traffic spike — check Section 7 for attacking IPs"
-        fi
+        [ "${WRITING:-0}" -ge 100 ] && \
+            warn "High WRITING count (${WRITING}) — many active responses in flight"
     else
-        warn "Nginx stub_status not reachable."
-        info "To enable, add to nginx.conf server block:"
+        warn "Nginx stub_status not reachable. Enable it:"
+        echo -e "    ${D}# In /etc/nginx/nginx.conf inside server {}:${N}"
         echo -e "    ${D}location /nginx_status {${N}"
         echo -e "    ${D}  stub_status on;${N}"
         echo -e "    ${D}  allow 127.0.0.1;${N}"
         echo -e "    ${D}  deny all;${N}"
         echo -e "    ${D}}${N}"
+        echo -e "    ${D}# Then: nginx -t && systemctl reload nginx${N}"
     fi
 
-    # Nginx error log — recent errors
+    # --- Nginx error log
     echo ""
-    info "Recent Nginx errors (last 20 lines):"
+    info "Recent Nginx errors:"
     NGINX_ERRLOG=""
     for ERRLOG in /var/log/nginx/error.log \
                   /usr/local/nginx/logs/error.log \
@@ -499,40 +672,86 @@ else
     done
 
     if [ -n "$NGINX_ERRLOG" ]; then
-        tail -20 "$NGINX_ERRLOG" 2>/dev/null | \
-            grep -vE "^\s*$" | \
-            while IFS= read -r l; do
-                if echo "$l" | grep -qi "crit\|emerg\|alert"; then
-                    echo -e "    ${R}$l${N}"
-                elif echo "$l" | grep -qi "error"; then
-                    echo -e "    ${Y}$l${N}"
-                else
-                    echo -e "    ${D}$l${N}"
-                fi
-            done
+        tail -20 "$NGINX_ERRLOG" 2>/dev/null | grep -vE "^\s*$" | \
+        while IFS= read -r l; do
+            if echo "$l" | grep -qi "crit\|emerg\|alert"; then
+                echo -e "    ${R}$l${N}"
+            elif echo "$l" | grep -qi "error"; then
+                echo -e "    ${Y}$l${N}"
+            else
+                echo -e "    ${D}$l${N}"
+            fi
+        done
     else
-        info "Nginx error log not found. Checked common paths."
+        info "Nginx error log not found — checked common paths."
     fi
 
-    # Nginx flood prevention info
+    # --- Global rate limiting status
     echo ""
-    info "Nginx rate limiting status:"
+    info "Global Nginx rate limiting (nginx.conf / conf.d):"
     NGINX_CONF=""
-    for CONF in /etc/nginx/nginx.conf \
-                /usr/local/nginx/conf/nginx.conf \
-                /etc/nginx/conf.d/default.conf; do
+    for CONF in /etc/nginx/nginx.conf /usr/local/nginx/conf/nginx.conf; do
         [ -f "$CONF" ] && NGINX_CONF="$CONF" && break
     done
 
     if [ -n "$NGINX_CONF" ]; then
-        RATE_LIMIT=$(grep -E "limit_req|limit_conn" "$NGINX_CONF" 2>/dev/null | head -5)
+        RATE_LIMIT=$(grep -rE "limit_req_zone|limit_conn_zone" \
+                     /etc/nginx/ 2>/dev/null | head -6)
         if [ -n "$RATE_LIMIT" ]; then
-            ok "Rate limiting is configured:"
+            ok "Rate limit zones defined:"
             echo "$RATE_LIMIT" | while IFS= read -r l; do echo -e "    ${D}$l${N}"; done
         else
-            warn "No limit_req or limit_conn found in ${NGINX_CONF}"
-            echo -e "    ${Y}→${N} Consider adding rate limiting — see Section 6 recommendations"
+            warn "No limit_req_zone or limit_conn_zone found in Nginx config"
+            echo -e "    ${Y}→${N} See Section 7 for how to add global + per-account rate limiting"
         fi
+    fi
+
+    # --- Per-account Nginx config directory
+    echo ""
+    NGINX_USERS_DIR="/etc/nginx/conf.d/users"
+    info "Per-account Nginx config directory: ${NGINX_USERS_DIR}"
+    echo ""
+
+    if [ -d "$NGINX_USERS_DIR" ]; then
+        CONF_COUNT=$(find "$NGINX_USERS_DIR" -name "*.conf" 2>/dev/null | wc -l)
+        ok "Directory exists — ${CONF_COUNT} per-account config file(s) found"
+        echo ""
+
+        # List all per-account configs and summarize what each does
+        find "$NGINX_USERS_DIR" -name "*.conf" 2>/dev/null | sort | \
+        while read -r cf; do
+            ACCT=$(basename "$cf" .conf)
+            echo -e "  ${B}Account: ${C}${ACCT}${N}  (${cf})"
+            # Show rate limit lines
+            ACCT_RATE=$(grep -E "limit_req|limit_conn|deny|allow|return 4|block" \
+                        "$cf" 2>/dev/null)
+            if [ -n "$ACCT_RATE" ]; then
+                echo "$ACCT_RATE" | while IFS= read -r l; do
+                    echo -e "    ${D}${l}${N}"
+                done
+            else
+                echo -e "    ${D}(no rate limiting or block rules found)${N}"
+            fi
+            echo ""
+        done
+
+        # Check if the top CPU account has a config
+        if [ -n "$TOP_CPU_ACCOUNT" ]; then
+            ACCT_CONF="${NGINX_USERS_DIR}/${TOP_CPU_ACCOUNT}.conf"
+            if [ -f "$ACCT_CONF" ]; then
+                ok "Top CPU account ${TOP_CPU_ACCOUNT} has an Nginx config: ${ACCT_CONF}"
+            else
+                warn "Top CPU account ${TOP_CPU_ACCOUNT} has NO per-account Nginx config"
+                echo -e "    ${Y}→${N} Consider creating: ${ACCT_CONF}"
+                echo -e "    ${Y}→${N} See Section 7 for ready-to-use config templates"
+            fi
+        fi
+    else
+        warn "Directory ${NGINX_USERS_DIR} does not exist yet"
+        echo -e "    ${Y}→${N} Create it: mkdir -p ${NGINX_USERS_DIR}"
+        echo -e "    ${Y}→${N} Then include it in nginx.conf inside http {}:"
+        echo -e "    ${D}    include /etc/nginx/conf.d/users/*.conf;${N}"
+        echo -e "    ${Y}→${N} See Section 7 for per-account config templates"
     fi
 fi
 
@@ -642,26 +861,174 @@ elif [ -n "$BUSY_PCT" ] && [ "${BUSY_PCT:-0}" -ge 80 ]; then
     echo -e "    ${Y}→${N} FIX: check if specific accounts or URLs are causing it (Section 4)"
 fi
 
-# --- Nginx flood prevention
+# --- Nginx per-account block recommendations
 if [ "$NGINX_RUNNING" = true ]; then
     echo ""
-    info "Nginx flood prevention recommendations:"
+    sep
+    echo -e "${B}  NGINX — PER-ACCOUNT BLOCKING & RATE LIMITING${N}"
+    sep
     echo ""
-    echo -e "  ${D}# Add rate limiting to nginx.conf (inside http {} block):${N}"
-    echo    "  limit_req_zone \$binary_remote_addr zone=one:10m rate=30r/m;"
+    echo -e "  ${B}How it works:${N}"
+    echo -e "  Each cPanel account gets its own Nginx config file at:"
+    echo -e "  ${C}  /etc/nginx/conf.d/users/<account>.conf${N}"
     echo ""
-    echo -e "  ${D}# Apply rate limit in server/location block:${N}"
-    echo    "  limit_req zone=one burst=10 nodelay;"
+    echo -e "  This lets you apply rules per-account without touching the global config."
+    echo -e "  All files in that directory are included automatically (if configured)."
     echo ""
-    echo -e "  ${D}# Limit connections per IP:${N}"
-    echo    "  limit_conn_zone \$binary_remote_addr zone=addr:10m;"
-    echo    "  limit_conn addr 10;"
+
+    # Step 1 — ensure include directive is in nginx.conf
+    echo -e "  ${B}Step 1 — Ensure the users directory is included in nginx.conf:${N}"
     echo ""
-    echo -e "  ${D}# Block bad user agents in nginx.conf:${N}"
-    echo    "  if (\$http_user_agent ~* (bot|crawler|spider|scan)) { return 444; }"
+    echo -e "  ${D}# Add inside http {} block in /etc/nginx/nginx.conf:${N}"
+    echo    "  include /etc/nginx/conf.d/users/*.conf;"
     echo ""
-    echo -e "  ${D}# Reload Nginx after changes:${N}"
+    echo -e "  ${D}# Create directory if it doesn't exist:${N}"
+    echo    "  mkdir -p /etc/nginx/conf.d/users"
+    echo ""
+
+    # Step 2 — global rate limit zones (must be in http block)
+    echo -e "  ${B}Step 2 — Add global rate limit zones (inside http {} in nginx.conf):${N}"
+    echo ""
+    echo -e "  ${D}# General rate limit zone (by IP):${N}"
+    echo    "  limit_req_zone \$binary_remote_addr zone=global_rate:10m rate=60r/m;"
+    echo ""
+    echo -e "  ${D}# Login page rate limit zone (stricter):${N}"
+    echo    "  limit_req_zone \$binary_remote_addr zone=login_rate:10m rate=10r/m;"
+    echo ""
+    echo -e "  ${D}# Connection limit zone:${N}"
+    echo    "  limit_conn_zone \$binary_remote_addr zone=conn_limit:10m;"
+    echo ""
+
+    # Step 3 — per-account config templates
+    echo -e "  ${B}Step 3 — Per-account config templates:${N}"
+    echo ""
+
+    # Template A: Rate limit wp-login + xmlrpc for one account
+    echo -e "  ${Y}Template A — Block wp-login & xmlrpc brute force for an account:${N}"
+    echo -e "  ${D}# File: /etc/nginx/conf.d/users/<account>.conf${N}"
+    cat << 'NGINX_TMPL_A'
+  # --- Rate limit wp-login.php
+  location ~* ^/home/<account>/public_html/wp-login\.php$ {
+      limit_req zone=login_rate burst=3 nodelay;
+      limit_conn conn_limit 5;
+      # Allow legitimate traffic through to Apache/LiteSpeed
+      proxy_pass http://127.0.0.1:8080;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+  }
+
+  # --- Block xmlrpc.php entirely for this account
+  location ~* ^/home/<account>/public_html/xmlrpc\.php$ {
+      return 444;  # Drop connection silently
+  }
+NGINX_TMPL_A
+    echo ""
+
+    # Template B: Block specific IPs for one account
+    echo -e "  ${Y}Template B — Block specific attacker IPs for one account:${N}"
+    echo -e "  ${D}# File: /etc/nginx/conf.d/users/<account>.conf${N}"
+    cat << 'NGINX_TMPL_B'
+  # --- IP blocklist for <account>
+  geo $block_<account> {
+      default         0;
+      1.2.3.4         1;   # Attacker IP
+      5.6.7.8         1;   # Attacker IP
+      192.168.1.0/24  1;   # Attacker subnet
+  }
+
+  server {
+      # Apply block inside the account's server block
+      if ($block_<account>) {
+          return 403;
+      }
+  }
+NGINX_TMPL_B
+    echo ""
+
+    # Template C: Full rate limiting + connection limit + bad UA block
+    echo -e "  ${Y}Template C — Full protection template for one account:${N}"
+    echo -e "  ${D}# File: /etc/nginx/conf.d/users/<account>.conf${N}"
+    cat << 'NGINX_TMPL_C'
+  # ============================================================
+  # Nginx per-account protection — <account>
+  # Applied via: /etc/nginx/conf.d/users/<account>.conf
+  # ============================================================
+
+  # Rate limit all requests for this account
+  location /~<account>/ {
+      limit_req zone=global_rate burst=20 nodelay;
+      limit_conn conn_limit 20;
+  }
+
+  # Strict rate limit on wp-login
+  location ~* /~<account>/wp-login\.php$ {
+      limit_req zone=login_rate burst=3 nodelay;
+      limit_conn conn_limit 3;
+      # Uncomment to block entirely:
+      # return 444;
+  }
+
+  # Block xmlrpc entirely
+  location ~* /~<account>/xmlrpc\.php$ {
+      return 444;
+  }
+
+  # Block bad user agents for this account
+  location /~<account>/ {
+      if ($http_user_agent ~* (masscan|nikto|sqlmap|nmap|zgrab|python-requests)) {
+          return 444;
+      }
+  }
+NGINX_TMPL_C
+    echo ""
+
+    # Template D: Block by country (if GeoIP module installed)
+    echo -e "  ${Y}Template D — Block by country for one account (requires GeoIP):${N}"
+    echo -e "  ${D}# File: /etc/nginx/conf.d/users/<account>.conf${N}"
+    cat << 'NGINX_TMPL_D'
+  # Requires: ngx_http_geoip_module
+  # In nginx.conf http {}: geoip_country /usr/share/GeoIP/GeoIP.dat;
+
+  location /~<account>/ {
+      # Block traffic from specific countries (e.g. CN, RU, KP)
+      if ($geoip_country_code ~ ^(CN|RU|KP|VN|UA)$) {
+          return 403;
+      }
+  }
+NGINX_TMPL_D
+    echo ""
+
+    # Step 4 — apply and reload
+    echo -e "  ${B}Step 4 — Apply changes:${N}"
+    echo ""
+    echo -e "  ${D}# Test config before reloading (always do this first):${N}"
+    echo    "  nginx -t"
+    echo ""
+    echo -e "  ${D}# Reload Nginx (no downtime):${N}"
+    echo    "  systemctl reload nginx"
+    echo ""
+    echo -e "  ${D}# Quick one-liner — create and apply a wp-login block for an account:${N}"
+    echo    "  ACCT=johndoe"
+    echo    "  cat > /etc/nginx/conf.d/users/\${ACCT}.conf << EOF"
+    echo    "  location ~* /wp-login\\.php\$ { limit_req zone=login_rate burst=3 nodelay; }"
+    echo    "  location ~* /xmlrpc\\.php\$ { return 444; }"
+    echo    "  EOF"
     echo    "  nginx -t && systemctl reload nginx"
+    echo ""
+
+    # Live example using top CPU account if detected
+    if [ -n "$TOP_CPU_ACCOUNT" ]; then
+        echo ""
+        warn "Top CPU account right now is: ${TOP_CPU_ACCOUNT}"
+        echo -e "    ${Y}→${N} To apply immediate protection for this account:"
+        echo    "    mkdir -p /etc/nginx/conf.d/users"
+        echo    "    cat > /etc/nginx/conf.d/users/${TOP_CPU_ACCOUNT}.conf << 'EOF'"
+        echo    "    # Protection for ${TOP_CPU_ACCOUNT} — added $(date '+%Y-%m-%d %H:%M')"
+        echo    "    location ~* /wp-login\\.php\$ { limit_req zone=login_rate burst=3 nodelay; }"
+        echo    "    location ~* /xmlrpc\\.php\$ { return 444; }"
+        echo    "    EOF"
+        echo    "    nginx -t && systemctl reload nginx"
+    fi
 fi
 
 # --- wp-login active
